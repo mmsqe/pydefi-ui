@@ -8,6 +8,9 @@ import type {
   AddV3PoolBody,
   AddFactoryBody,
   RunBackfillBody,
+  QuoteBody,
+  QuoteResult,
+  BuildBody,
 } from "./types";
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -92,6 +95,22 @@ export async function runBackfill(
   body: RunBackfillBody
 ): Promise<{ message: string; task_id?: string }> {
   return apiFetch<{ message: string; task_id?: string }>("/api/indexer/backfill", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+// ── Swap endpoints ───────────────────────────────────────────────────────────
+
+export async function fetchQuote(body: QuoteBody): Promise<QuoteResult> {
+  return apiFetch<QuoteResult>("/api/swap/quote", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function buildSwap(body: BuildBody): Promise<unknown> {
+  return apiFetch<unknown>("/api/swap/build", {
     method: "POST",
     body: JSON.stringify(body),
   });

@@ -36,6 +36,18 @@ Open [http://localhost:3000](http://localhost:3000).
 
 Click **Connect Wallet** in the top-right. Any EIP-1193 browser wallet works (Rabby, MetaMask, etc.). The active chain is highlighted in the topbar.
 
+## Pages
+
+| Route | Description |
+|---|---|
+| `/` | Dashboard — pool stats, latest block, factory overview |
+| `/pools` | Pool explorer with search, history chart per pool |
+| `/swap` | Token swap — off-chain quote, route visualiser, Build & Sign |
+| `/routing-lab` | Interactive pool graph — drag nodes, click two tokens to simulate a route |
+| `/program-builder` | pydefi VM program composer — assemble wrap/approve/swap/CCTP steps |
+| `/factories` | AMM factory registry |
+| `/indexer` | Indexer control panel — backfill, state view |
+
 ## Project layout
 
 ```
@@ -47,12 +59,14 @@ backend/
     pools.py       GET/POST/DELETE /api/pools
     factories.py   GET/POST /api/factories
     indexer.py     GET/POST /api/indexer
+    swap.py        POST /api/swap/quote  (off-chain route + quote)
+                   POST /api/swap/build  (501 — DeFi VM integration pending)
 
 frontend/
   src/
     app/           Next.js App Router pages
     components/    UI components (layout, wallet, charts)
-    lib/           API client, wagmi config, types, utils
+    lib/           API client (api.ts), wagmi config, types, utils
 ```
 
 ## Linting

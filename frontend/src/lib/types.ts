@@ -83,3 +83,43 @@ export interface RunBackfillBody {
   to_block?: number;
   batch_size?: number;
 }
+
+// ── Swap ─────────────────────────────────────────────────────────────────────
+
+export interface QuoteRouteStep {
+  token_in: string;
+  token_out: string;
+  pool_address: string;
+  protocol: string;
+  fee_bps: number;
+  pct: number;
+}
+
+export interface QuoteBody {
+  token_in: string;
+  token_out: string;
+  amount_in: string;
+  is_native_in?: boolean;
+  is_native_out?: boolean;
+  chain_id?: number;
+}
+
+export interface QuoteResult {
+  amount_out: string;
+  amount_out_human: string;
+  price_impact: string;
+  token_in: string;
+  token_out: string;
+  route: QuoteRouteStep[];
+}
+
+export interface BuildBody {
+  token_in: string;
+  token_out: string;
+  amount_in: string;
+  amount_out_min: string;
+  slippage_bps?: number;
+  sender: string;
+  is_native_in?: boolean;
+  is_native_out?: boolean;
+}

@@ -1,0 +1,128 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-base: #0a0b0e;
+  --surface: #0f1117;
+  --card: #13161e;
+  --border-dim: #1e2132;
+  --cyan: #00d4ff;
+  --purple: #8b5cf6;
+  --green: #00ff87;
+  --muted: #64748b;
+  --text-primary: #e8eaf0;
+  --text-secondary: #94a3b8;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background-color: #0a0b0e;
+  color: #e8eaf0;
+  font-family: Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0f1117;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1e2132;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2a2f48;
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #1e2132 #0f1117;
+}
+
+@layer utilities {
+  .text-gradient-cyan {
+    background: linear-gradient(135deg, #00d4ff, #0080ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .text-gradient-purple {
+    background: linear-gradient(135deg, #8b5cf6, #c084fc);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .text-gradient-green {
+    background: linear-gradient(135deg, #00ff87, #00c853);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .neon-cyan {
+    color: #00d4ff;
+    text-shadow: 0 0 10px rgba(0, 212, 255, 0.6), 0 0 20px rgba(0, 212, 255, 0.3);
+  }
+
+  .neon-purple {
+    color: #8b5cf6;
+    text-shadow: 0 0 10px rgba(139, 92, 246, 0.6), 0 0 20px rgba(139, 92, 246, 0.3);
+  }
+
+  .neon-green {
+    color: #00ff87;
+    text-shadow: 0 0 10px rgba(0, 255, 135, 0.6), 0 0 20px rgba(0, 255, 135, 0.3);
+  }
+
+  .glow-border-cyan {
+    border-color: rgba(0, 212, 255, 0.4);
+    box-shadow: 0 0 8px rgba(0, 212, 255, 0.15), inset 0 0 8px rgba(0, 212, 255, 0.05);
+  }
+
+  .card-hover {
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  .card-hover:hover {
+    border-color: rgba(0, 212, 255, 0.3);
+    box-shadow: 0 0 16px rgba(0, 212, 255, 0.1);
+  }
+
+  .row-hover:hover {
+    background: rgba(0, 212, 255, 0.04);
+    box-shadow: inset 3px 0 0 rgba(0, 212, 255, 0.5);
+  }
+}
+
+@layer components {
+  .stat-value {
+    @apply text-2xl font-bold font-mono;
+    color: #00d4ff;
+    text-shadow: 0 0 12px rgba(0, 212, 255, 0.4);
+  }
+
+  .label-muted {
+    @apply text-xs uppercase tracking-wider text-muted;
+  }
+}

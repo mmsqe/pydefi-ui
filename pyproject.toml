@@ -1,0 +1,24 @@
+[project]
+name = "pydefi-ui"
+version = "0.1.0"
+description = "Next.js + FastAPI dashboard for the pydefi AMM pool indexer"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "sqlmodel>=0.0.18",
+    "web3>=7.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.4.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501", "E402"]

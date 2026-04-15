@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environment
+.venv/
+
+# uv
+uv.lock
+
+# Next.js
+frontend/.next/
+frontend/node_modules/
+frontend/.env*.local
+frontend/tsconfig.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# Env
+.env
+.envrc

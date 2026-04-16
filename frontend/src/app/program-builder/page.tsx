@@ -1,104 +1,555 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
   ArrowLeftRight,
-  Zap,
   RefreshCcw,
   Link2,
   Shield,
   Plus,
   Play,
   Trash2,
-  GripVertical,
+  ChevronDown,
+  ChevronUp,
+  Loader,
+  Code,
+  Wifi,
+  ArrowUp,
+  ArrowDown,
+  Terminal,
 } from "lucide-react";
+import { fetchPools } from "@/lib/api";
+import type { Pool } from "@/lib/types";
 
-const BLOCK_PALETTE = [
+// ── Block catalogue ───────────────────────────────────────────────────────────
+
+const BLOCK_DEFS = [
   {
-    id: "approve",
+    type: "wrap_eth",
+    label: "Wrap ETH",
+    icon: RefreshCcw,
+    color: "#627EEA",
+    desc: "WETH.deposit() — convert native ETH to WETH",
+  },
+  {
+    type: "unwrap_weth",
+    label: "Unwrap WETH",
+    icon: RefreshCcw,
+    color: "#a78bfa",
+    desc: "WETH.withdraw() — redeem WETH back to ETH",
+  },
+  {
+    type: "approve",
     label: "Approve",
     icon: Shield,
     color: "#00d4ff",
-    desc: "ERC20 token approval",
+    desc: "ERC-20 token.approve(spender, uint256.max)",
   },
   {
-    id: "swap",
-    label: "Swap",
-    icon: ArrowLeftRight,
-    color: "#8b5cf6",
-    desc: "Token swap via pool",
-  },
-  {
-    id: "flashloan",
-    label: "Flash Loan",
-    icon: Zap,
-    color: "#f59e0b",
-    desc: "Borrow and repay in one tx",
-  },
-  {
-    id: "loop",
-    label: "Loop",
-    icon: RefreshCcw,
-    color: "#00ff87",
-    desc: "Repeat operation N times",
-  },
-  {
-    id: "transfer",
+    type: "transfer",
     label: "Transfer",
     icon: Link2,
     color: "#f43f5e",
-    desc: "Move tokens to address",
+    desc: "ERC-20 token.transfer(recipient, amount)",
   },
-];
+  {
+    type: "swap",
+    label: "Swap",
+    icon: ArrowLeftRight,
+    color: "#8b5cf6",
+    desc: "Multi-hop token swap compiled to DeFiVM bytecode",
+  },
+  {
+    type: "cctp_bridge",
+    label: "CCTP Bridge",
+    icon: Wifi,
+    color: "#f59e0b",
+    desc: "Circle CCTP v2 depositForBurnWithHook cross-chain transfer",
+  },
+  {
+    type: "call_contract",
+    label: "Call Contract",
+    icon: Code,
+    color: "#64748b",
+    desc: "Arbitrary contract call with optional ETH value",
+  },
+] as const;
+
+type BlockType = (typeof BLOCK_DEFS)[number]["type"];
+
+interface BlockConfig {
+  // wrap_eth / unwrap_weth
+  amount?: string;
+  // approve
+  token?: string;
+  spender?: string;
+  // transfer
+  recipient?: string;
+  // swap
+  token_in?: string;
+  token_out?: string;
+  amount_in?: string;
+  slippage_bps?: string;
+  // cctp_bridge
+  destination_chain?: string;
+  cctp_amount?: string;
+  // call_contract
+  contract_address?: string;
+  calldata?: string;
+  call_value?: string;
+}
+
+interface QuoteState {
+  loading: boolean;
+  amount_out_human?: string;
+  price_impact?: string;
+  route?: { token_in: string; token_out: string; protocol: string; fee_bps: number }[];
+  error?: string;
+}
 
 interface CanvasBlock {
   id: string;
-  type: string;
-  label: string;
-  color: string;
-  order: number;
+  type: BlockType;
+  config: BlockConfig;
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function defFor(type: BlockType) {
+  return BLOCK_DEFS.find((d) => d.type === type)!;
+}
+
+function blockLabel(block: CanvasBlock): string {
+  const def = defFor(block.type);
+  const c = block.config;
+  switch (block.type) {
+    case "wrap_eth":   return c.amount ? `Wrap ${c.amount} ETH → WETH` : def.label;
+    case "unwrap_weth": return c.amount ? `Unwrap ${c.amount} WETH → ETH` : def.label;
+    case "approve":    return c.token && c.spender ? `Approve ${c.token} → ${c.spender.slice(0, 8)}…` : def.label;
+    case "transfer":   return c.token && c.recipient ? `Transfer ${c.amount ?? "?"} ${c.token} → ${c.recipient.slice(0, 8)}…` : def.label;
+    case "swap":       return c.token_in && c.token_out ? `Swap ${c.amount_in ?? "?"} ${c.token_in} → ${c.token_out}` : def.label;
+    case "cctp_bridge": return c.destination_chain ? `CCTP → ${c.destination_chain}` : def.label;
+    case "call_contract": return c.contract_address ? `Call ${c.contract_address.slice(0, 10)}…` : def.label;
+  }
+}
+
+const CCTP_CHAINS: Record<string, { label: string; domain: number }> = {
+  "Arbitrum Sepolia": { label: "Arbitrum Sepolia", domain: 3 },
+  "Base Sepolia":     { label: "Base Sepolia",     domain: 6 },
+  "Optimism Sepolia": { label: "Optimism Sepolia", domain: 2 },
+  "Mainnet":          { label: "Ethereum",         domain: 0 },
+  "Arbitrum":         { label: "Arbitrum One",     domain: 3 },
+};
+
+// ── Pseudo-bytecode assembler ─────────────────────────────────────────────────
+
+function assemblePseudo(
+  blocks: CanvasBlock[],
+  quotes: Record<string, QuoteState>,
+): string {
+  if (blocks.length === 0) return "; (empty program)";
+  const lines: string[] = [];
+  blocks.forEach((b, i) => {
+    const c = b.config;
+    lines.push(`; ── Step ${i + 1}: ${blockLabel(b)} ──`);
+    switch (b.type) {
+      case "wrap_eth":
+        lines.push(`CALL  WETH.deposit()  value=${c.amount ?? "?"} ETH`);
+        lines.push(`POP`);
+        break;
+      case "unwrap_weth":
+        lines.push(`CALL  WETH.withdraw(amount=${c.amount ?? "?"})`);
+        lines.push(`POP`);
+        break;
+      case "approve":
+        lines.push(`CALL  ${c.token ?? "TOKEN"}.approve(`);
+        lines.push(`        spender=${c.spender ?? "?"},`);
+        lines.push(`        amount=UINT256_MAX`);
+        lines.push(`      )`);
+        lines.push(`POP`);
+        break;
+      case "transfer":
+        lines.push(`CALL  ${c.token ?? "TOKEN"}.transfer(`);
+        lines.push(`        recipient=${c.recipient ?? "?"},`);
+        lines.push(`        amount=${c.amount ?? "?"}`);
+        lines.push(`      )`);
+        lines.push(`POP`);
+        break;
+      case "swap": {
+        const q = quotes[b.id];
+        const minOut = q?.amount_out_human
+          ? ` → ~${parseFloat(q.amount_out_human).toPrecision(5)} ${c.token_out} (${c.slippage_bps ?? "50"} bps slippage)`
+          : "";
+        lines.push(`; build_multi_hop_program(swap_route_to_hops(route, defi_vm, sender))`);
+        lines.push(`SWAP  ${c.amount_in ?? "?"} ${c.token_in ?? "?"} → ${c.token_out ?? "?"}${minOut}`);
+        if (q?.route) {
+          q.route.forEach((s) => {
+            lines.push(`        via ${s.protocol} pool  fee=${s.fee_bps / 100}%`);
+          });
+        }
+        lines.push(`POP`);
+        break;
+      }
+      case "cctp_bridge": {
+        const domain = c.destination_chain ? (CCTP_CHAINS[c.destination_chain]?.domain ?? "?") : "?";
+        lines.push(`CALL  CCTP.depositForBurnWithHook(`);
+        lines.push(`        amount=${c.cctp_amount ?? "from stack"},`);
+        lines.push(`        destinationDomain=${domain},`);
+        lines.push(`        burnToken=USDC`);
+        lines.push(`      )`);
+        lines.push(`POP`);
+        break;
+      }
+      case "call_contract":
+        lines.push(`CALL  ${c.contract_address ?? "0x?"}(`);
+        lines.push(`        data=${c.calldata ? c.calldata.slice(0, 18) + "…" : "0x"},`);
+        lines.push(`        value=${c.call_value ?? "0"} ETH`);
+        lines.push(`      )`);
+        lines.push(`POP`);
+        break;
+    }
+    lines.push("");
+  });
+  return lines.join("\n");
+}
+
+// ── Config form for a single block ────────────────────────────────────────────
+
+function BlockConfigForm({
+  block,
+  symbols,
+  quote,
+  onChange,
+}: {
+  block: CanvasBlock;
+  symbols: string[];
+  quote: QuoteState | undefined;
+  onChange: (id: string, patch: Partial<BlockConfig>) => void;
+}) {
+  const c = block.config;
+  const set = (patch: Partial<BlockConfig>) => onChange(block.id, patch);
+
+  const inputCls =
+    "w-full bg-[#0d1117] border border-border-dim rounded-lg px-2.5 py-1.5 text-xs text-[#e8eaf0] focus:outline-none focus:border-cyan/40";
+  const labelCls = "text-[10px] text-muted uppercase tracking-wider block mb-1";
+
+  switch (block.type) {
+    case "wrap_eth":
+    case "unwrap_weth":
+      return (
+        <div>
+          <label className={labelCls}>Amount ({block.type === "wrap_eth" ? "ETH" : "WETH"})</label>
+          <input type="number" min="0" step="any" placeholder="0.1"
+            value={c.amount ?? ""} onChange={(e) => set({ amount: e.target.value })}
+            className={inputCls} />
+        </div>
+      );
+
+    case "approve":
+      return (
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className={labelCls}>Token</label>
+            <select value={c.token ?? ""} onChange={(e) => set({ token: e.target.value })}
+              className={inputCls + " appearance-none"}>
+              <option value="">Select token</option>
+              {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className={labelCls}>Spender address</label>
+            <input type="text" placeholder="0x…" value={c.spender ?? ""}
+              onChange={(e) => set({ spender: e.target.value })} className={inputCls} />
+          </div>
+        </div>
+      );
+
+    case "transfer":
+      return (
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <label className={labelCls}>Token</label>
+            <select value={c.token ?? ""} onChange={(e) => set({ token: e.target.value })}
+              className={inputCls + " appearance-none"}>
+              <option value="">Select</option>
+              {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className={labelCls}>Amount</label>
+            <input type="number" min="0" step="any" placeholder="1.0" value={c.amount ?? ""}
+              onChange={(e) => set({ amount: e.target.value })} className={inputCls} />
+          </div>
+          <div>
+            <label className={labelCls}>Recipient</label>
+            <input type="text" placeholder="0x…" value={c.recipient ?? ""}
+              onChange={(e) => set({ recipient: e.target.value })} className={inputCls} />
+          </div>
+        </div>
+      );
+
+    case "swap":
+      return (
+        <div className="space-y-3">
+          <div className="grid grid-cols-3 gap-3">
+            <div>
+              <label className={labelCls}>Token in</label>
+              <select value={c.token_in ?? ""} onChange={(e) => set({ token_in: e.target.value })}
+                className={inputCls + " appearance-none"}>
+                <option value="">Select</option>
+                {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className={labelCls}>Token out</label>
+              <select value={c.token_out ?? ""} onChange={(e) => set({ token_out: e.target.value })}
+                className={inputCls + " appearance-none"}>
+                <option value="">Select</option>
+                {symbols.filter((s) => s !== c.token_in).map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className={labelCls}>Amount in</label>
+              <input type="number" min="0" step="any" placeholder="1.0" value={c.amount_in ?? ""}
+                onChange={(e) => set({ amount_in: e.target.value })} className={inputCls} />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className={labelCls}>Slippage (bps)</label>
+              <input type="number" min="0" max="10000" step="1" placeholder="50" value={c.slippage_bps ?? ""}
+                onChange={(e) => set({ slippage_bps: e.target.value })} className={inputCls} />
+            </div>
+            {/* Quote preview */}
+            <div className="flex flex-col justify-end">
+              {quote?.loading && (
+                <span className="flex items-center gap-1.5 text-xs text-muted">
+                  <Loader size={11} className="animate-spin" /> quoting…
+                </span>
+              )}
+              {quote?.error && !quote.loading && (
+                <span className="text-[10px] text-red-400 leading-tight">{quote.error}</span>
+              )}
+              {quote?.amount_out_human && !quote.loading && (
+                <span className="text-xs text-green-400 font-mono">
+                  ≈ {parseFloat(quote.amount_out_human).toPrecision(6)} {c.token_out}
+                  {quote.price_impact && quote.price_impact !== "NaN" && (
+                    <span className="text-muted ml-1 text-[10px]">
+                      ({(parseFloat(quote.price_impact) * 100).toFixed(2)}% impact)
+                    </span>
+                  )}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+
+    case "cctp_bridge":
+      return (
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className={labelCls}>Destination chain</label>
+            <select value={c.destination_chain ?? ""} onChange={(e) => set({ destination_chain: e.target.value })}
+              className={inputCls + " appearance-none"}>
+              <option value="">Select chain</option>
+              {Object.keys(CCTP_CHAINS).map((k) => <option key={k} value={k}>{k}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className={labelCls}>Amount (USDC) — leave blank for stack</label>
+            <input type="number" min="0" step="any" placeholder="from stack" value={c.cctp_amount ?? ""}
+              onChange={(e) => set({ cctp_amount: e.target.value })} className={inputCls} />
+          </div>
+        </div>
+      );
+
+    case "call_contract":
+      return (
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className={labelCls}>Contract address</label>
+              <input type="text" placeholder="0x…" value={c.contract_address ?? ""}
+                onChange={(e) => set({ contract_address: e.target.value })} className={inputCls} />
+            </div>
+            <div>
+              <label className={labelCls}>ETH value</label>
+              <input type="number" min="0" step="any" placeholder="0" value={c.call_value ?? ""}
+                onChange={(e) => set({ call_value: e.target.value })} className={inputCls} />
+            </div>
+          </div>
+          <div>
+            <label className={labelCls}>Calldata (hex)</label>
+            <input type="text" placeholder="0x..." value={c.calldata ?? ""}
+              onChange={(e) => set({ calldata: e.target.value })} className={inputCls + " font-mono"} />
+          </div>
+        </div>
+      );
+  }
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
+
 export default function ProgramBuilderPage() {
-  const [canvasBlocks, setCanvasBlocks] = useState<CanvasBlock[]>([
-    { id: "b1", type: "approve", label: "Approve WETH", color: "#00d4ff", order: 0 },
-    { id: "b2", type: "swap", label: "Swap WETH → USDC", color: "#8b5cf6", order: 1 },
-  ]);
+  const [blocks, setBlocks] = useState<CanvasBlock[]>([]);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [pools, setPools] = useState<Pool[]>([]);
+  const [quotes, setQuotes] = useState<Record<string, QuoteState>>({});
+  const [running, setRunning] = useState(false);
+  const [runResult, setRunResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const quoteTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
-  const addBlock = (block: (typeof BLOCK_PALETTE)[0]) => {
-    const newBlock: CanvasBlock = {
-      id: `block-${Date.now()}`,
-      type: block.id,
-      label: block.label,
-      color: block.color,
-      order: canvasBlocks.length,
-    };
-    setCanvasBlocks((prev) => [...prev, newBlock]);
-  };
+  // Load pools once for token symbol lists
+  useEffect(() => {
+    fetchPools().then(setPools).catch(() => {});
+  }, []);
 
-  const removeBlock = (id: string) => {
-    setCanvasBlocks((prev) =>
-      prev.filter((b) => b.id !== id).map((b, i) => ({ ...b, order: i }))
+  const symbols = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of pools) {
+      set.add(p.token0_symbol);
+      set.add(p.token1_symbol);
+    }
+    return Array.from(set).sort();
+  }, [pools]);
+
+  // ── Block mutations ──────────────────────────────────────────────────────
+
+  const addBlock = useCallback((type: BlockType) => {
+    const id = `b-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    setBlocks((prev) => [...prev, { id, type, config: {} }]);
+    setExpanded(id);
+  }, []);
+
+  const removeBlock = useCallback((id: string) => {
+    setBlocks((prev) => prev.filter((b) => b.id !== id));
+    setExpanded((e) => (e === id ? null : e));
+    setQuotes((q) => { const next = { ...q }; delete next[id]; return next; });
+  }, []);
+
+  const moveBlock = useCallback((id: string, dir: -1 | 1) => {
+    setBlocks((prev) => {
+      const idx = prev.findIndex((b) => b.id === id);
+      if (idx < 0) return prev;
+      const next = [...prev];
+      const target = idx + dir;
+      if (target < 0 || target >= next.length) return prev;
+      [next[idx], next[target]] = [next[target], next[idx]];
+      return next;
+    });
+  }, []);
+
+  const updateConfig = useCallback((id: string, patch: Partial<BlockConfig>) => {
+    setBlocks((prev) =>
+      prev.map((b) => (b.id === id ? { ...b, config: { ...b.config, ...patch } } : b))
     );
-  };
+  }, []);
+
+  // ── Auto-quote for swap blocks ───────────────────────────────────────────
+
+  useEffect(() => {
+    for (const block of blocks) {
+      if (block.type !== "swap") continue;
+      const { token_in, token_out, amount_in } = block.config;
+      const id = block.id;
+
+      if (quoteTimers.current[id]) clearTimeout(quoteTimers.current[id]);
+
+      if (!token_in || !token_out || !amount_in || parseFloat(amount_in) <= 0) {
+        setQuotes((q) => {
+          const next = { ...q };
+          delete next[id];
+          return next;
+        });
+        continue;
+      }
+
+      quoteTimers.current[id] = setTimeout(async () => {
+        setQuotes((q) => ({ ...q, [id]: { loading: true } }));
+        try {
+          const res = await fetch("/api/swap/quote", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              token_in,
+              token_out,
+              amount_in,
+              is_native_in: token_in === "ETH",
+              is_native_out: token_out === "ETH",
+            }),
+          });
+          if (!res.ok) {
+            const text = await res.text().catch(() => res.statusText);
+            let detail = text;
+            try { detail = JSON.parse(text).detail ?? text; } catch { /* ignore */ }
+            throw new Error(detail);
+          }
+          const data = await res.json();
+          setQuotes((q) => ({
+            ...q,
+            [id]: {
+              loading: false,
+              amount_out_human: data.amount_out_human,
+              price_impact: data.price_impact,
+              route: data.route,
+            },
+          }));
+        } catch (e: unknown) {
+          setQuotes((q) => ({
+            ...q,
+            [id]: { loading: false, error: e instanceof Error ? e.message : String(e) },
+          }));
+        }
+      }, 500);
+    }
+    // Cleanup timers on unmount
+    const timers = quoteTimers.current;
+    return () => { Object.values(timers).forEach(clearTimeout); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blocks]);
+
+  // ── Run / build ──────────────────────────────────────────────────────────
+
+  const handleRun = useCallback(async () => {
+    if (blocks.length === 0) return;
+    setRunning(true);
+    setRunResult(null);
+    try {
+      const res = await fetch("/api/swap/build", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ steps: blocks.map((b) => ({ type: b.type, config: b.config })) }),
+      });
+      const data = await res.json();
+      if (res.status === 501) {
+        setRunResult({ ok: false, message: data.detail ?? "DeFi VM integration pending — execution not yet available." });
+      } else if (!res.ok) {
+        setRunResult({ ok: false, message: data.detail ?? res.statusText });
+      } else {
+        setRunResult({ ok: true, message: JSON.stringify(data, null, 2) });
+      }
+    } catch (e: unknown) {
+      setRunResult({ ok: false, message: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setRunning(false);
+    }
+  }, [blocks]);
+
+  const pseudocode = useMemo(() => assemblePseudo(blocks, quotes), [blocks, quotes]);
+
+  // ── Render ───────────────────────────────────────────────────────────────
 
   return (
     <div className="max-w-7xl space-y-4">
       {/* Header */}
-      <div className="flex items-start justify-between">
-        <div>
-          <h2 className="text-2xl font-bold text-[#e8eaf0] mb-1">
-            DeFi Program Builder
-          </h2>
-          <p className="text-sm text-muted">
-            Compose DeFi operations visually with the pydefi VM
-          </p>
-        </div>
-        <Badge variant="purple">Coming Soon</Badge>
+      <div>
+        <h2 className="text-2xl font-bold text-[#e8eaf0] mb-1">DeFi Program Builder</h2>
+        <p className="text-sm text-muted">
+          Compose pydefi VM operations into a multi-step on-chain program
+        </p>
       </div>
 
       {/* Two-panel layout */}
@@ -106,38 +557,28 @@ export default function ProgramBuilderPage() {
         {/* Block Palette */}
         <Card className="lg:col-span-1">
           <CardHeader>
-            <CardTitle>Block Palette</CardTitle>
+            <CardTitle>Operations</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-2 p-3">
-            {BLOCK_PALETTE.map((block) => {
-              const Icon = block.icon;
+          <CardContent className="space-y-1.5 p-3">
+            {BLOCK_DEFS.map((def) => {
+              const Icon = def.icon;
               return (
                 <button
-                  key={block.id}
-                  onClick={() => addBlock(block)}
-                  className="w-full flex items-start gap-3 p-3 rounded-xl border border-border-dim hover:border-opacity-50 transition-all text-left group"
-                  style={{
-                    "--hover-color": block.color,
-                  } as React.CSSProperties}
+                  key={def.type}
+                  onClick={() => addBlock(def.type as BlockType)}
+                  className="w-full flex items-start gap-2.5 p-2.5 rounded-xl border border-border-dim hover:border-opacity-60 transition-all text-left group"
                 >
                   <div
-                    className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5"
-                    style={{
-                      backgroundColor: `${block.color}15`,
-                      border: `1px solid ${block.color}30`,
-                    }}
+                    className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5"
+                    style={{ backgroundColor: `${def.color}15`, border: `1px solid ${def.color}30` }}
                   >
-                    <Icon size={14} style={{ color: block.color }} />
+                    <Icon size={13} style={{ color: def.color }} />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <p className="text-xs font-semibold text-[#e8eaf0] group-hover:text-white transition-colors">
-                      {block.label}
-                    </p>
-                    <p className="text-[10px] text-muted mt-0.5 leading-tight">
-                      {block.desc}
-                    </p>
+                    <p className="text-xs font-semibold text-[#e8eaf0]">{def.label}</p>
+                    <p className="text-[10px] text-muted mt-0.5 leading-tight">{def.desc}</p>
                   </div>
-                  <Plus size={12} className="text-muted group-hover:text-cyan transition-colors flex-shrink-0 mt-1" />
+                  <Plus size={11} className="text-muted group-hover:text-cyan transition-colors flex-shrink-0 mt-1" />
                 </button>
               );
             })}
@@ -149,85 +590,123 @@ export default function ProgramBuilderPage() {
           <CardHeader>
             <CardTitle>Canvas</CardTitle>
             <div className="flex items-center gap-2">
-              <span className="text-xs text-muted">{canvasBlocks.length} operations</span>
-              <Button variant="ghost" size="sm" className="gap-1.5 text-green opacity-60" disabled>
-                <Play size={12} />
-                Run Sandbox
-              </Button>
+              <span className="text-xs text-muted">{blocks.length} step{blocks.length !== 1 ? "s" : ""}</span>
+              <button
+                onClick={handleRun}
+                disabled={running || blocks.length === 0}
+                className={cn(
+                  "flex items-center gap-1.5 text-xs px-3 py-1 rounded-lg border transition-all",
+                  blocks.length === 0
+                    ? "border-border-dim text-muted opacity-40 cursor-not-allowed"
+                    : "border-green-500/30 text-green-400 hover:bg-green-500/10"
+                )}
+              >
+                {running ? <Loader size={11} className="animate-spin" /> : <Play size={11} />}
+                Build & Execute
+              </button>
             </div>
           </CardHeader>
+
           <CardContent className="flex-1 p-3">
-            {canvasBlocks.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center">
-                <div className="w-16 h-16 rounded-2xl bg-border-dim/30 flex items-center justify-center mb-3">
-                  <Plus size={24} className="text-muted" />
+            {blocks.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-center min-h-64">
+                <div className="w-14 h-14 rounded-2xl bg-border-dim/30 flex items-center justify-center mb-3">
+                  <Plus size={22} className="text-muted" />
                 </div>
                 <p className="text-sm font-medium text-muted mb-1">Canvas is empty</p>
-                <p className="text-xs text-muted/60">
-                  Click blocks from the palette to add them
-                </p>
+                <p className="text-xs text-muted/60">Click an operation from the palette to add it</p>
               </div>
             ) : (
               <div className="space-y-2">
-                {/* Connection line header */}
-                <div className="flex items-center gap-2 px-3 py-1.5">
-                  <div className="text-xs text-muted font-mono">#</div>
-                  <div className="text-xs text-muted uppercase tracking-wider">Operation</div>
-                </div>
+                {blocks.map((block, index) => {
+                  const def = defFor(block.type);
+                  const Icon = def.icon;
+                  const isExpanded = expanded === block.id;
+                  return (
+                    <div key={block.id} className="relative">
+                      {/* Connector */}
+                      {index < blocks.length - 1 && (
+                        <div
+                          className="absolute left-[18px] top-full w-0.5 h-2 z-10"
+                          style={{ backgroundColor: `${def.color}35` }}
+                        />
+                      )}
 
-                {canvasBlocks.map((block, index) => (
-                  <div key={block.id} className="relative">
-                    {/* Connector line */}
-                    {index < canvasBlocks.length - 1 && (
                       <div
-                        className="absolute left-[22px] top-full w-0.5 h-2 z-10"
-                        style={{ backgroundColor: `${block.color}40` }}
-                      />
-                    )}
-                    <div
-                      className="flex items-center gap-3 p-3 rounded-xl border transition-all group"
-                      style={{
-                        backgroundColor: `${block.color}06`,
-                        borderColor: `${block.color}20`,
-                      }}
-                    >
-                      {/* Drag handle (visual only) */}
-                      <GripVertical size={12} className="text-muted/40 flex-shrink-0 cursor-grab" />
-
-                      {/* Step number */}
-                      <div
-                        className="w-6 h-6 rounded-lg flex items-center justify-center text-[10px] font-bold font-mono flex-shrink-0"
+                        className="border rounded-xl transition-all"
                         style={{
-                          backgroundColor: `${block.color}20`,
-                          color: block.color,
-                          border: `1px solid ${block.color}30`,
+                          backgroundColor: `${def.color}06`,
+                          borderColor: isExpanded ? `${def.color}40` : `${def.color}18`,
                         }}
                       >
-                        {index + 1}
-                      </div>
+                        {/* Header row */}
+                        <div className="flex items-center gap-2.5 px-3 py-2.5">
+                          {/* Step number */}
+                          <div
+                            className="w-6 h-6 rounded-md flex items-center justify-center text-[10px] font-bold font-mono flex-shrink-0"
+                            style={{ backgroundColor: `${def.color}20`, color: def.color, border: `1px solid ${def.color}30` }}
+                          >
+                            {index + 1}
+                          </div>
 
-                      {/* Block info */}
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-[#e8eaf0]">{block.label}</p>
-                        <p className="text-xs text-muted font-mono">{block.type}</p>
-                      </div>
+                          <Icon size={13} style={{ color: def.color }} className="flex-shrink-0" />
 
-                      {/* Actions */}
-                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <button
-                          onClick={() => removeBlock(block.id)}
-                          className="p-1.5 rounded-lg hover:bg-red-500/10 hover:text-red-400 text-muted transition-colors"
-                        >
-                          <Trash2 size={12} />
-                        </button>
+                          <span className="text-xs font-medium text-[#e8eaf0] flex-1 min-w-0 truncate">
+                            {blockLabel(block)}
+                          </span>
+
+                          {/* Quote badge */}
+                          {block.type === "swap" && quotes[block.id]?.amount_out_human && !quotes[block.id]?.loading && (
+                            <span className="text-[10px] text-green-400 font-mono hidden sm:block">
+                              ≈{parseFloat(quotes[block.id].amount_out_human!).toPrecision(4)} {block.config.token_out}
+                            </span>
+                          )}
+                          {block.type === "swap" && quotes[block.id]?.loading && (
+                            <Loader size={11} className="animate-spin text-muted" />
+                          )}
+
+                          {/* Controls */}
+                          <div className="flex items-center gap-0.5">
+                            <button onClick={() => moveBlock(block.id, -1)} disabled={index === 0}
+                              className="p-1 rounded hover:bg-white/5 text-muted disabled:opacity-20 transition-colors">
+                              <ArrowUp size={11} />
+                            </button>
+                            <button onClick={() => moveBlock(block.id, 1)} disabled={index === blocks.length - 1}
+                              className="p-1 rounded hover:bg-white/5 text-muted disabled:opacity-20 transition-colors">
+                              <ArrowDown size={11} />
+                            </button>
+                            <button
+                              onClick={() => setExpanded((e) => (e === block.id ? null : block.id))}
+                              className="p-1 rounded hover:bg-white/5 text-muted transition-colors"
+                            >
+                              {isExpanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+                            </button>
+                            <button onClick={() => removeBlock(block.id)}
+                              className="p-1 rounded hover:bg-red-500/10 text-muted hover:text-red-400 transition-colors">
+                              <Trash2 size={11} />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Expanded config form */}
+                        {isExpanded && (
+                          <div className="px-3 pb-3 border-t border-white/5 pt-3">
+                            <BlockConfigForm
+                              block={block}
+                              symbols={symbols}
+                              quote={quotes[block.id]}
+                              onChange={updateConfig}
+                            />
+                          </div>
+                        )}
                       </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
 
                 {/* Add more hint */}
-                <div className="flex items-center gap-3 p-3 rounded-xl border border-dashed border-border-dim text-muted hover:border-cyan/20 transition-colors">
-                  <Plus size={14} className="ml-8" />
+                <div className="flex items-center gap-2.5 p-2.5 rounded-xl border border-dashed border-border-dim text-muted hover:border-cyan/20 transition-colors">
+                  <Plus size={13} className="ml-8" />
                   <span className="text-xs">Add operation from palette</span>
                 </div>
               </div>
@@ -236,26 +715,32 @@ export default function ProgramBuilderPage() {
         </Card>
       </div>
 
-      {/* Coming soon notice */}
+      {/* Program Preview */}
       <Card>
-        <CardContent className="py-4 px-5">
-          <div className="flex items-start gap-3">
-            <div className="w-8 h-8 rounded-xl bg-purple/10 border border-purple/20 flex items-center justify-center flex-shrink-0">
-              <Zap size={14} className="text-purple" />
-            </div>
-            <div>
-              <p className="text-sm font-semibold text-[#e8eaf0] mb-1">
-                DeFi VM Integration Pending
-              </p>
-              <p className="text-xs text-muted leading-relaxed">
-                The Program Builder will connect to the pydefi fluent VM to compose, simulate,
-                and execute multi-step DeFi programs. Features include Monaco editor with
-                auto-complete, live transaction preview, Permit2 signing, and sandbox simulation.
-              </p>
-            </div>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <Terminal size={14} className="text-cyan" />
+            <CardTitle>Program Preview</CardTitle>
           </div>
+          <p className="text-xs text-muted">Pseudo-bytecode assembled from canvas steps</p>
+        </CardHeader>
+        <CardContent className="p-0">
+          <pre className="p-4 text-[11px] font-mono text-[#94a3b8] leading-5 overflow-x-auto bg-[#0a0b0e] rounded-b-xl whitespace-pre">
+            {pseudocode}
+          </pre>
         </CardContent>
       </Card>
+
+      {/* Run result */}
+      {runResult && (
+        <Card>
+          <CardContent className="py-3 px-4">
+            <p className={cn("text-xs font-mono", runResult.ok ? "text-green-400" : "text-amber-400")}>
+              {runResult.message}
+            </p>
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

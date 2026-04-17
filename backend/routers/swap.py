@@ -14,6 +14,7 @@ from typing import Optional
 from eth_contract import Contract
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from pydefi.deployments import get_address
 from pydefi.exceptions import NoRouteFoundError
 from pydefi.indexer.models import Pool, V2SyncEvent, V3SwapEvent
 from pydefi.pathfinder.graph import PoolEdge, PoolGraph, V3PoolEdge
@@ -31,17 +32,24 @@ router = APIRouter()
 # Sentinel used by pydefi for native ETH
 _NATIVE_ADDRESS = Token.NATIVE_ADDRESS
 
-# Known Uniswap V3 QuoterV2 addresses by chain ID (used for on-chain quote).
-# quote_swap_transaction does a single eth_call against the QuoterV2 to get the
-# actual amountOut from current on-chain pool state — much more accurate than
-# the indexed (potentially stale) off-chain estimate.
-_V3_QUOTER_BY_CHAIN: dict[int, str] = {
-    1:        "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",  # Mainnet
-    11155111: "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3",  # Sepolia
-    8453:     "0x3d4e44Eb1374240CE5F1B136041212047e93690c",  # Base
-    42161:    "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",  # Arbitrum
-    137:      "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",  # Polygon
+# Chains not yet in pydefi/deployments.py — residual fallback only.
+_V3_QUOTER_EXTRA: dict[int, str] = {
+    8453:  "0x3d4e44Eb1374240CE5F1B136041212047e93690c",  # Base
+    42161: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",  # Arbitrum
+    137:   "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",  # Polygon
 }
+
+
+def _get_v3_quoter(chain_id: int) -> str:
+    """Return the Uniswap V3 QuoterV2 address for *chain_id*.
+
+    Prefers the pydefi deployment registry (``get_address``); falls back to the
+    residual table for chains not yet registered there.
+    """
+    try:
+        return get_address("UNISWAP_V3_QUOTER", chain_id)
+    except KeyError:
+        return _V3_QUOTER_EXTRA.get(chain_id, "")
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +153,41 @@ def _build_graph(
 
 
 # ---------------------------------------------------------------------------
+# DAG serialization
+# ---------------------------------------------------------------------------
+
+
+def _serialize_dag(dag) -> dict:
+    """Convert a RouteDAG to a JSON-serializable dict for the frontend."""
+    from pydefi.types import RouteSplit, RouteSwap
+
+    def _actions(actions) -> list:
+        result = []
+        for action in actions:
+            if isinstance(action, RouteSwap):
+                result.append({
+                    "type": "swap",
+                    "token_out": action.token_out.symbol,
+                    "pool_address": action.pool.pool_address,
+                    "protocol": action.pool.protocol,
+                    "fee_bps": action.pool.fee_bps,
+                })
+            elif isinstance(action, RouteSplit):
+                result.append({
+                    "type": "split",
+                    "token_out": action.token_out.symbol,
+                    "legs": [
+                        {"fraction_bps": leg.fraction_bps, "actions": _actions(leg.actions)}
+                        for leg in action.legs
+                    ],
+                })
+        return result
+
+    payload = dag.to_dict()
+    return {"token_in": payload["token_in"].symbol, "actions": _actions(payload["actions"])}
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -182,8 +225,10 @@ def get_quote(body: QuoteBody) -> dict:
     if amount_in_raw <= 0:
         raise HTTPException(status_code=422, detail="amount_in must be positive.")
 
+    router_obj = Router(graph)
     try:
-        route = Router(graph).find_best_route(TokenAmount(tok_in, amount_in_raw), tok_out)
+        route = router_obj.find_best_route(TokenAmount(tok_in, amount_in_raw), tok_out)
+        dag = router_obj.find_best_route_dag(TokenAmount(tok_in, amount_in_raw), tok_out)
     except NoRouteFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -193,23 +238,13 @@ def get_quote(body: QuoteBody) -> dict:
     price_impact = route.price_impact
     price_impact_str = "NaN" if price_impact.is_nan() else str(price_impact.quantize(Decimal("0.000001")))
 
-    steps = []
-    for step in route.steps:
-        steps.append({
-            "token_in": step.token_in.symbol,
-            "token_out": step.token_out.symbol,
-            "pool_address": step.pool_address,
-            "protocol": step.protocol,
-            "fee_bps": step.fee,
-        })
-
     return {
         "amount_out": str(amount_out_raw),
         "amount_out_human": amount_out_human,
         "price_impact": price_impact_str,
         "token_in": body.token_in,
         "token_out": body.token_out,
-        "route": steps,
+        "dag": _serialize_dag(dag),
     }
 
 
@@ -291,7 +326,7 @@ async def build_swap(body: BuildBody) -> dict:
     if rpc_url and is_all_v3:
         quoter_address = (
             os.environ.get("V3_QUOTER_ADDRESS", "").strip()
-            or _V3_QUOTER_BY_CHAIN.get(tok_in.chain_id, "")
+            or _get_v3_quoter(tok_in.chain_id)
         )
         if quoter_address:
             try:

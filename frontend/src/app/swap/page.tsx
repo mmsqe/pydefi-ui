@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useEffect, useCallback } from "react";
+import React, { useState, useMemo, useEffect, useCallback } from "react";
 import useSWR from "swr";
 import {
   useAccount,
@@ -29,57 +29,109 @@ import {
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 // ---------------------------------------------------------------------------
-// Route visualizer
+// DAG visualizer
 // ---------------------------------------------------------------------------
 
-interface RouteHop {
-  from: string;
-  to: string;
-  protocol: string;
-  pool: string;
-  pct: number;
-}
-
-type RouteStep = {
-  token_in: string;
+interface DAGSwap {
+  type: "swap";
   token_out: string;
   pool_address: string;
   protocol: string;
   fee_bps: number;
-  pct: number;
-};
+}
 
-const ROUTE_COLORS = ["#00d4ff", "#8b5cf6", "#00ff87"];
+interface DAGSplit {
+  type: "split";
+  token_out: string;
+  legs: { fraction_bps: number; actions: DAGAction[] }[];
+}
 
-function RouteVisualizer({
-  tokenIn,
-  tokenOut,
-  liveRoute,
-}: {
-  tokenIn: string;
-  tokenOut: string;
-  liveRoute?: RouteStep[] | null;
-}) {
-  const isNativeIn = tokenIn === "ETH";
+type DAGAction = DAGSwap | DAGSplit;
 
-  const routes: RouteHop[][] = useMemo(() => {
-    if (liveRoute && liveRoute.length > 0) {
-      return [
-        liveRoute.map((s) => ({
-          from: s.token_in,
-          to: s.token_out,
-          protocol: s.protocol.toUpperCase(),
-          pool: `${s.pool_address.slice(0, 6)}…${s.pool_address.slice(-4)}`,
-          pct: s.pct || 100,
-        })),
-      ];
+interface RouteDAGData {
+  token_in: string;
+  actions: DAGAction[];
+}
+
+const ROUTE_COLORS = ["#00d4ff", "#8b5cf6", "#00ff87", "#f59e0b"];
+
+function normalizeProtocol(protocol: string): string {
+  const p = protocol.toUpperCase();
+  if (p.includes("V4")) return "V4";
+  if (p.includes("V3")) return "V3";
+  if (p.includes("V2")) return "V2";
+  return p.slice(0, 6);
+}
+
+function TokenNode({ symbol, color }: { symbol: string; color: string }) {
+  return (
+    <span
+      className="text-xs font-semibold px-2 py-0.5 rounded-md border"
+      style={{ color, borderColor: `${color}30`, backgroundColor: `${color}10` }}
+    >
+      {symbol}
+    </span>
+  );
+}
+
+function PoolHopNode({ action, color }: { action: DAGSwap; color: string }) {
+  const proto = normalizeProtocol(action.protocol);
+  return (
+    <div
+      className="flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs"
+      style={{ borderColor: `${color}25`, backgroundColor: `${color}08` }}
+    >
+      <span className="text-muted font-mono text-[10px]">
+        {action.pool_address.slice(0, 6)}…{action.pool_address.slice(-4)}
+      </span>
+      <Badge
+        variant={proto.includes("3") || proto.includes("4") ? "cyan" : "purple"}
+        className="text-[9px] px-1 py-0"
+      >
+        {proto}
+      </Badge>
+      <span className="text-muted text-[10px]">{action.fee_bps / 100}%</span>
+    </div>
+  );
+}
+
+/** Renders a flat sequence of swap actions as a horizontal hop chain. */
+function LegChain({ tokenIn, actions, color }: { tokenIn: string; actions: DAGAction[]; color: string }) {
+  const nodes: React.ReactNode[] = [<TokenNode key="in" symbol={tokenIn} color={color} />];
+  actions.forEach((action, i) => {
+    if (action.type === "swap") {
+      nodes.push(<span key={`a${i}`} className="text-muted text-xs">→</span>);
+      nodes.push(<PoolHopNode key={`p${i}`} action={action} color={color} />);
+      nodes.push(<span key={`b${i}`} className="text-muted text-xs">→</span>);
+      nodes.push(<TokenNode key={`t${i}`} symbol={action.token_out} color={color} />);
     }
-    // Placeholder shown before a quote is fetched
-    const eff = isNativeIn ? "WETH" : tokenIn;
-    return [
-      [{ from: eff, to: tokenOut, protocol: "V3", pool: "0x????…????", pct: 100 }],
-    ];
-  }, [liveRoute, tokenIn, tokenOut, isNativeIn]);
+    // nested splits rendered as opaque (rare in find_best_route_dag output)
+  });
+  return <div className="flex items-center gap-1.5 flex-wrap">{nodes}</div>;
+}
+
+function DAGVisualizer({ dag, isNativeIn }: { dag?: RouteDAGData | null; isNativeIn: boolean }) {
+  // Flatten to a list of legs: { color, pct, tokenIn, actions }
+  const legs = useMemo(() => {
+    if (!dag) return null;
+    const splitIdx = dag.actions.findIndex((a) => a.type === "split");
+    if (splitIdx === -1) {
+      return [{ color: ROUTE_COLORS[0], pct: 100, tokenIn: dag.token_in, actions: dag.actions }];
+    }
+    const split = dag.actions[splitIdx] as DAGSplit;
+    // token at the split input = last token produced by any pre-split swaps
+    let splitTokenIn = dag.token_in;
+    for (let i = 0; i < splitIdx; i++) {
+      const a = dag.actions[i];
+      if (a.type === "swap") splitTokenIn = a.token_out;
+    }
+    return split.legs.map((leg, i) => ({
+      color: ROUTE_COLORS[i % ROUTE_COLORS.length],
+      pct: leg.fraction_bps / 100,
+      tokenIn: splitTokenIn,
+      actions: leg.actions,
+    }));
+  }, [dag]);
 
   return (
     <div className="space-y-3">
@@ -90,75 +142,45 @@ function RouteVisualizer({
           <span className="font-mono bg-amber-500/15 border border-amber-500/25 rounded px-1.5 py-0.5">WRAP</span>
           <span className="text-muted">→</span>
           <span className="font-semibold">WETH</span>
-          <span className="text-muted ml-1">auto-wrapped via Universal Router</span>
+          <span className="text-muted ml-1">auto-wrapped atomically</span>
         </div>
       )}
 
-      {routes.map((route, ri) => (
-        <div key={ri} className="flex items-center gap-2">
-          <div
-            className="w-10 text-right text-xs font-mono font-bold flex-shrink-0"
-            style={{ color: ROUTE_COLORS[ri % ROUTE_COLORS.length] }}
-          >
-            {route[route.length - 1].pct}%
+      {!legs ? (
+        /* placeholder before any quote */
+        <div className="flex items-center gap-1.5 opacity-40">
+          <TokenNode symbol={isNativeIn ? "WETH" : "—"} color={ROUTE_COLORS[0]} />
+          <span className="text-muted text-xs">→</span>
+          <div className="flex items-center gap-1 px-2 py-0.5 rounded-md border border-border-dim text-xs">
+            <span className="text-muted font-mono text-[10px]">0x????…????</span>
+            <span className="text-muted text-[10px]">V3</span>
           </div>
-          <div className="relative h-1.5 rounded-full bg-border-dim flex-shrink-0 w-20">
-            <div
-              className="absolute left-0 top-0 h-full rounded-full"
-              style={{
-                width: `${route[route.length - 1].pct}%`,
-                backgroundColor: ROUTE_COLORS[ri % ROUTE_COLORS.length],
-                boxShadow: `0 0 6px ${ROUTE_COLORS[ri % ROUTE_COLORS.length]}80`,
-              }}
-            />
-          </div>
-          <div className="flex items-center gap-1.5 flex-wrap">
-            {route.map((hop, hi) => (
-              <div key={hi} className="flex items-center gap-1.5">
-                {hi === 0 && (
-                  <span
-                    className="text-xs font-semibold px-2 py-0.5 rounded-md border"
-                    style={{
-                      color: ROUTE_COLORS[ri % ROUTE_COLORS.length],
-                      borderColor: `${ROUTE_COLORS[ri % ROUTE_COLORS.length]}30`,
-                      backgroundColor: `${ROUTE_COLORS[ri % ROUTE_COLORS.length]}10`,
-                    }}
-                  >
-                    {hop.from}
-                  </span>
-                )}
-                <span className="text-muted text-xs">→</span>
-                <div
-                  className="flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs"
-                  style={{
-                    borderColor: `${ROUTE_COLORS[ri % ROUTE_COLORS.length]}25`,
-                    backgroundColor: `${ROUTE_COLORS[ri % ROUTE_COLORS.length]}08`,
-                  }}
-                >
-                  <span className="text-muted font-mono text-[10px]">{hop.pool}</span>
-                  <Badge
-                    variant={hop.protocol.includes("3") || hop.protocol.includes("4") ? "cyan" : "purple"}
-                    className="text-[9px] px-1 py-0"
-                  >
-                    {hop.protocol}
-                  </Badge>
-                </div>
-                <span className="text-muted text-xs">→</span>
-                <span
-                  className="text-xs font-semibold px-2 py-0.5 rounded-md border"
-                  style={{
-                    color: ROUTE_COLORS[ri % ROUTE_COLORS.length],
-                    borderColor: `${ROUTE_COLORS[ri % ROUTE_COLORS.length]}30`,
-                    backgroundColor: `${ROUTE_COLORS[ri % ROUTE_COLORS.length]}10`,
-                  }}
-                >
-                  {hop.to}
-                </span>
-              </div>
-            ))}
-          </div>
+          <span className="text-muted text-xs">→</span>
+          <TokenNode symbol="—" color={ROUTE_COLORS[0]} />
         </div>
-      ))}
+      ) : (
+        legs.map((leg, i) => (
+          <div key={i} className="flex items-center gap-2">
+            {/* pct + glow bar */}
+            <div className="flex-shrink-0 flex items-center gap-1.5 w-[4.5rem]">
+              <div className="relative flex-1 h-1.5 rounded-full bg-border-dim">
+                <div
+                  className="absolute left-0 top-0 h-full rounded-full"
+                  style={{
+                    width: `${leg.pct}%`,
+                    backgroundColor: leg.color,
+                    boxShadow: `0 0 6px ${leg.color}80`,
+                  }}
+                />
+              </div>
+              <span className="text-[10px] font-mono font-bold flex-shrink-0" style={{ color: leg.color }}>
+                {leg.pct}%
+              </span>
+            </div>
+            <LegChain tokenIn={leg.tokenIn} actions={leg.actions} color={leg.color} />
+          </div>
+        ))
+      )}
     </div>
   );
 }
@@ -176,7 +198,7 @@ export default function SwapPage() {
   const [slippage, setSlippage] = useState("0.5");
 
   const [quoteResult, setQuoteResult] = useState<string | null>(null);
-  const [quoteRoute, setQuoteRoute] = useState<RouteStep[] | null>(null);
+  const [quoteDag, setQuoteDag] = useState<RouteDAGData | null>(null);
   const [priceImpact, setPriceImpact] = useState<string | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
   const [quoteError, setQuoteError] = useState<string | null>(null);
@@ -289,19 +311,18 @@ export default function SwapPage() {
           const detail = await res.json().then((j) => j.detail ?? JSON.stringify(j)).catch(() => res.statusText);
           setQuoteError(String(detail));
           setQuoteResult(null);
-          setQuoteRoute(null);
+          setQuoteDag(null);
           setPriceImpact(null);
         } else {
           const data = await res.json();
           setQuoteResult(data.amount_out_human ?? String(data.amount_out));
           setPriceImpact(data.price_impact ?? null);
-          if (Array.isArray(data.route) && data.route.length > 0) setQuoteRoute(data.route);
-          else setQuoteRoute(null);
+          setQuoteDag(data.dag ?? null);
         }
       } catch {
         setQuoteError("Could not reach the API — is the backend running?");
         setQuoteResult(null);
-        setQuoteRoute(null);
+        setQuoteDag(null);
         setPriceImpact(null);
       } finally {
         setQuoteLoading(false);
@@ -314,7 +335,7 @@ export default function SwapPage() {
     const amt = parseFloat(amountIn);
     if (!amountIn || isNaN(amt) || amt <= 0 || exceedsBalance) {
       setQuoteResult(null);
-      setQuoteRoute(null);
+      setQuoteDag(null);
       setPriceImpact(null);
       setQuoteError(null);
       return;
@@ -429,7 +450,7 @@ export default function SwapPage() {
               <div className="relative">
                 <select
                   value={tokenIn}
-                  onChange={(e) => { setTokenIn(e.target.value); setQuoteResult(null); setQuoteRoute(null); }}
+                  onChange={(e) => { setTokenIn(e.target.value); setQuoteResult(null); setQuoteDag(null); }}
                   className="appearance-none bg-card border border-border-dim rounded-xl pl-3 pr-8 py-2 text-sm font-semibold text-[#e8eaf0] focus:outline-none focus:border-cyan/40 cursor-pointer"
                 >
                   {tokenSymbols.filter((t) => t !== tokenOut).map((t) => (
@@ -449,7 +470,7 @@ export default function SwapPage() {
           {/* Swap direction */}
           <div className="flex justify-center -my-1 z-10 relative">
             <button
-              onClick={() => { setTokenIn(tokenOut); setTokenOut(tokenIn); setQuoteResult(null); setQuoteRoute(null); setQuoteError(null); }}
+              onClick={() => { setTokenIn(tokenOut); setTokenOut(tokenIn); setQuoteResult(null); setQuoteDag(null); setQuoteError(null); }}
               className="bg-card border border-border-dim rounded-xl p-2 hover:border-cyan/30 hover:bg-cyan/5 transition-all group"
             >
               <ArrowDownUp size={16} className="text-muted group-hover:text-cyan transition-colors" />
@@ -478,7 +499,7 @@ export default function SwapPage() {
               <div className="relative">
                 <select
                   value={tokenOut}
-                  onChange={(e) => { setTokenOut(e.target.value); setQuoteResult(null); setQuoteRoute(null); }}
+                  onChange={(e) => { setTokenOut(e.target.value); setQuoteResult(null); setQuoteDag(null); }}
                   className="appearance-none bg-card border border-border-dim rounded-xl pl-3 pr-8 py-2 text-sm font-semibold text-[#e8eaf0] focus:outline-none focus:border-cyan/40 cursor-pointer"
                 >
                   {tokenSymbols.filter((t) => t !== tokenIn).map((t) => (
@@ -627,21 +648,28 @@ export default function SwapPage() {
         </CardContent>
       </Card>
 
-      {/* Route visualizer */}
+      {/* DAG route visualizer */}
       <Card>
         <CardHeader>
-          <CardTitle>Split Route</CardTitle>
-          <Badge variant={quoteRoute ? "cyan" : "muted"}>{quoteRoute ? "Live" : "—"}</Badge>
+          <CardTitle>Route</CardTitle>
+          <Badge variant={quoteDag ? "cyan" : "muted"}>{quoteDag ? "Live" : "—"}</Badge>
         </CardHeader>
         <CardContent>
           <div className="mb-4 pb-3 border-b border-border-dim flex items-center justify-between text-xs">
             <span className="text-muted">{tokenIn} → {tokenOut}</span>
             <span className="text-muted">
-              {quoteRoute ? `${quoteRoute.length} hop${quoteRoute.length !== 1 ? "s" : ""}` : "awaiting quote"}
+              {quoteDag
+                ? (() => {
+                    const split = quoteDag.actions.find((a) => a.type === "split") as DAGSplit | undefined;
+                    if (split) return `split · ${split.legs.length} legs`;
+                    const hops = quoteDag.actions.filter((a) => a.type === "swap").length;
+                    return `${hops} hop${hops !== 1 ? "s" : ""}`;
+                  })()
+                : "awaiting quote"}
             </span>
           </div>
-          <RouteVisualizer tokenIn={tokenIn} tokenOut={tokenOut} liveRoute={quoteRoute} />
-          {!quoteRoute && (
+          <DAGVisualizer dag={quoteDag} isNativeIn={isNativeIn} />
+          {!quoteDag && (
             <p className="text-xs text-muted mt-4 italic flex items-center gap-1.5">
               <Info size={10} />
               Enter an amount to see the live route.

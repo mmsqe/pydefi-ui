@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException
 from pydefi.aggregator.base import AggregatorQuote
 from pydefi.deployments import get_address
 from pydefi.exceptions import NoRouteFoundError
-from pydefi.indexer.models import Pool, V2SyncEvent, V3SwapEvent
+from pydefi.indexer import Pool, V2SyncEvent, V3SwapEvent
 from pydefi.pathfinder.graph import PoolEdge, PoolGraph, V3PoolEdge
 from pydefi.pathfinder.router import Router
 from pydefi.types import Token, TokenAmount
@@ -239,10 +239,11 @@ def get_quote(body: dict) -> dict:
     router_obj = Router(graph)
     try:
         route = router_obj.find_best_route(TokenAmount(tok_in, amount_in_raw), tok_out)
-        dag = router_obj.find_best_route_dag(TokenAmount(tok_in, amount_in_raw), tok_out)
+        dag = router_obj.find_best_split(TokenAmount(tok_in, amount_in_raw), tok_out)
     except NoRouteFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    amount_out_raw = route.amount_out.amount
     quote = AggregatorQuote(
         token_in=tok_in,
         token_out=tok_out,
@@ -255,7 +256,6 @@ def get_quote(body: dict) -> dict:
         route_summary=f"{tok_in.symbol} → {tok_out.symbol}",
     )
 
-    amount_out_raw = quote.amount_out.amount
     amount_out_human = str(Decimal(amount_out_raw) / Decimal(10**tok_out.decimals))
     price_impact_str = "NaN" if quote.price_impact.is_nan() else str(quote.price_impact.quantize(Decimal("0.000001")))
 

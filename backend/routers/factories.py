@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
-from pydefi.indexer.models import Factory, IndexerState
+from pydefi.indexer import Factory, IndexerState
 from sqlmodel import Session, select
 
 from backend.deps import get_indexer

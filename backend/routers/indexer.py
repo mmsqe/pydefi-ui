@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import APIRouter, HTTPException
-from pydefi.indexer.models import IndexerState
+from pydefi.indexer import IndexerState
 from sqlmodel import Session, select
 from web3 import AsyncWeb3
 

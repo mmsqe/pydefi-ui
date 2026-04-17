@@ -8,7 +8,7 @@ from typing import Optional
 
 import sqlalchemy as sa
 from fastapi import APIRouter
-from pydefi.indexer.models import Factory, IndexerState, Pool, V2SyncEvent, V3SwapEvent
+from pydefi.indexer import Factory, IndexerState, Pool, V2SyncEvent, V3SwapEvent
 from sqlmodel import Session
 
 from backend.deps import get_indexer

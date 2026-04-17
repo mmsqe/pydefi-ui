@@ -602,12 +602,14 @@ export default function RoutingLabPage() {
                   {dagPoolAddresses(quote.dag.actions).length === 0 && (
                     <p className="text-xs text-muted">No swaps in route.</p>
                   )}
-                  {(function renderActions(actions: DAGAction[], tokenIn: string) {
-                    return actions.map((action, i) => {
+                  {(function renderActions(actions: DAGAction[], tokenIn: string): React.ReactNode[] {
+                    const nodes: React.ReactNode[] = [];
+                    let currentToken = tokenIn;
+                    actions.forEach((action, i) => {
                       if (action.type === "swap") {
-                        return (
+                        nodes.push(
                           <div key={i} className="flex items-center gap-2 text-xs">
-                            <span className="font-mono" style={{ color: tokenColor(tokenIn) }}>{tokenIn}</span>
+                            <span className="font-mono" style={{ color: tokenColor(currentToken) }}>{currentToken}</span>
                             <ArrowRight size={10} className="text-muted flex-shrink-0" />
                             <span className="font-mono" style={{ color: tokenColor(action.token_out) }}>{action.token_out}</span>
                             <span
@@ -618,15 +620,21 @@ export default function RoutingLabPage() {
                             </span>
                           </div>
                         );
+                        currentToken = action.token_out;
+                      } else {
+                        // split — each leg starts from the same currentToken
+                        action.legs.forEach((leg, j) => {
+                          nodes.push(
+                            <div key={`${i}-${j}`} className="pl-3 border-l border-border-dim/40 space-y-1">
+                              <span className="text-[10px] text-cyan font-mono">{leg.fraction_bps / 100}%</span>
+                              {renderActions(leg.actions, currentToken)}
+                            </div>
+                          );
+                        });
+                        currentToken = action.token_out;
                       }
-                      // split
-                      return action.legs.map((leg, j) => (
-                        <div key={`${i}-${j}`} className="pl-3 border-l border-border-dim/40 space-y-1">
-                          <span className="text-[10px] text-cyan font-mono">{leg.fraction_bps / 100}%</span>
-                          {renderActions(leg.actions, tokenIn)}
-                        </div>
-                      ));
                     });
+                    return nodes;
                   })(quote.dag.actions, quote.dag.token_in)}
                 </div>
               </div>

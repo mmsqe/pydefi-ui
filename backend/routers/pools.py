@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 import sqlalchemy as sa
 from fastapi import APIRouter, HTTPException
-from pydefi.indexer.models import Pool, V2SyncEvent, V3SwapEvent
+from pydefi.indexer import Pool, V2SyncEvent, V3SwapEvent
 from sqlmodel import Session, select
 
 from backend.deps import get_indexer

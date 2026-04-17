@@ -8,10 +8,8 @@ GET  /api/indexer/state     — list checkpoints for all tracked addresses
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 from pydefi.indexer.models import IndexerState
 from sqlmodel import Session, select
 from web3 import AsyncWeb3
@@ -21,38 +19,39 @@ from backend.deps import get_indexer, get_rpc_url
 router = APIRouter()
 
 
-class BackfillBody(BaseModel):
-    from_block: int
-    to_block: Optional[int] = None
-    batch_size: int = 2000
-    pool_address: Optional[str] = None
-
-
 @router.post("/indexer/backfill")
-def backfill(body: BackfillBody) -> dict:
+def backfill(body: dict) -> dict:
     """Run a historical back-fill for registered pools / factories.
 
     Requires the ``RPC_URL`` environment variable to be set.  Creates a
     fresh :class:`~web3.AsyncWeb3` instance, assigns it to the indexer, then
     runs :meth:`~pydefi.indexer.PoolIndexer.backfill` synchronously via
     ``asyncio.run``.
+
+    Request body keys (mirror :meth:`~pydefi.indexer.PoolIndexer.backfill`):
+      - ``from_block``: int (required)
+      - ``to_block``: int | null (default: latest)
+      - ``batch_size``: int (default: 2000)
+      - ``pool_address``: str | null (default: all pools)
     """
+    try:
+        from_block = int(body["from_block"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="from_block (int) is required.")
+
     rpc_url = get_rpc_url()
     if not rpc_url:
-        raise HTTPException(
-            status_code=400,
-            detail="RPC_URL environment variable is not set.",
-        )
+        raise HTTPException(status_code=400, detail="RPC_URL environment variable is not set.")
 
     indexer = get_indexer()
     indexer.w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
 
     events_stored: int = asyncio.run(
         indexer.backfill(
-            from_block=body.from_block,
-            to_block=body.to_block,
-            batch_size=body.batch_size,
-            pool_address=body.pool_address,
+            from_block=from_block,
+            to_block=body.get("to_block"),
+            batch_size=int(body.get("batch_size", 2000)),
+            pool_address=body.get("pool_address"),
         )
     )
 

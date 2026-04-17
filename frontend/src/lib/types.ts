@@ -54,12 +54,6 @@ export interface IndexerStateItem {
   last_indexed_block: number;
 }
 
-export interface AddFactoryBody {
-  factory_address: string;
-  protocol: string;
-  chain_id: number;
-}
-
 export interface RunBackfillBody {
   pool_address?: string;
   from_block: number;

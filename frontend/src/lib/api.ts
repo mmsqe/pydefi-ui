@@ -4,7 +4,6 @@ import type {
   PoolHistory,
   Stats,
   IndexerStateItem,
-  AddFactoryBody,
   RunBackfillBody,
   SwapRequest,
 } from "./types";
@@ -80,7 +79,7 @@ export async function addV3Pool(body: Omit<Pool, "last_indexed_block">): Promise
   });
 }
 
-export async function addFactory(body: AddFactoryBody): Promise<Factory> {
+export async function addFactory(body: Omit<Factory, "last_indexed_block" | "pools_discovered">): Promise<Factory> {
   return apiFetch<Factory>("/api/factories", {
     method: "POST",
     body: JSON.stringify(body),

@@ -12,6 +12,7 @@ from decimal import Decimal, InvalidOperation
 
 from eth_contract import Contract
 from fastapi import APIRouter, HTTPException
+from pydefi.abi.amm import UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR, UNISWAP_V3_FACTORY, UNISWAP_V3_POOL
 from pydefi.aggregator.base import AggregatorQuote
 from pydefi.deployments import get_address
 from pydefi.exceptions import NoRouteFoundError
@@ -202,12 +203,120 @@ def _serialize_dag(dag) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# On-demand pool discovery (used as fallback when no route is found)
+# ---------------------------------------------------------------------------
+
+_ZERO_ADDR = "0x" + "0" * 40
+
+
+async def _augment_graph_on_demand(
+    graph: PoolGraph,
+    tok_in: Token,
+    tok_out: Token,
+    rpc_url: str,
+) -> PoolGraph:
+    """Discover direct pools for (tok_in, tok_out) via factory eth_calls.
+
+    Called only after NoRouteFoundError — bypasses the event index and reads
+    current slot0/liquidity directly so newly deployed or never-traded pools
+    work without a backfill.  Adds edges to *graph* in-place and returns it.
+    """
+    from web3 import AsyncWeb3
+
+    w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
+    chain_id = tok_in.chain_id
+    addr_a = tok_in.address
+    addr_b = tok_out.address
+
+    try:
+        v3_factory_addr = get_address("UNISWAP_V3_FACTORY", chain_id)
+    except KeyError:
+        v3_factory_addr = ""
+    try:
+        v2_factory_addr = get_address("UNISWAP_V2_FACTORY", chain_id)
+    except KeyError:
+        v2_factory_addr = ""
+
+    # -- V3 pools across fee tiers -----------------------------------------
+    if v3_factory_addr:
+        factory = UNISWAP_V3_FACTORY(to=v3_factory_addr)
+        for fee_tier in (100, 500, 3000, 10000):
+            try:
+                pool_addr = await factory.fns.getPool(addr_a, addr_b, fee_tier).call(w3)
+            except Exception:
+                continue
+            if not pool_addr or pool_addr.lower() == _ZERO_ADDR:
+                continue
+            pool_contract = UNISWAP_V3_POOL(to=pool_addr)
+            try:
+                token0_addr = await pool_contract.fns.token0().call(w3)
+                slot0 = await pool_contract.fns.slot0().call(w3)
+                liquidity = await pool_contract.fns.liquidity().call(w3)
+            except Exception:
+                continue
+            sqrt_price_x96 = slot0[0]
+            if sqrt_price_x96 == 0 or liquidity == 0:
+                continue
+            fee_bps = fee_tier // 100
+            for t_in, t_out in ((tok_in, tok_out), (tok_out, tok_in)):
+                graph.add_pool(
+                    V3PoolEdge(
+                        token_in=t_in,
+                        token_out=t_out,
+                        pool_address=pool_addr.lower(),
+                        protocol="UniswapV3",
+                        fee_bps=fee_bps,
+                        sqrt_price_x96=sqrt_price_x96,
+                        liquidity=liquidity,
+                        is_token0_in=(token0_addr.lower() == t_in.address.lower()),
+                    )
+                )
+
+    # -- V2 pair -----------------------------------------------------------
+    if v2_factory_addr:
+        factory_v2 = UNISWAP_V2_FACTORY(to=v2_factory_addr)
+        try:
+            pair_addr = await factory_v2.fns.getPair(addr_a, addr_b).call(w3)
+        except Exception:
+            pair_addr = _ZERO_ADDR
+        if pair_addr and pair_addr.lower() != _ZERO_ADDR:
+            pair = UNISWAP_V2_PAIR(to=pair_addr)
+            try:
+                token0_v2 = await pair.fns.token0().call(w3)
+                reserves = await pair.fns.getReserves().call(w3)
+                r0, r1 = int(reserves[0]), int(reserves[1])
+            except Exception:
+                r0 = r1 = 0
+            if r0 > 0 and r1 > 0:
+                tok0 = tok_in if token0_v2.lower() == addr_a.lower() else tok_out
+                tok1 = tok_out if token0_v2.lower() == addr_a.lower() else tok_in
+                for t_in, t_out, r_in, r_out in (
+                    (tok0, tok1, r0, r1),
+                    (tok1, tok0, r1, r0),
+                ):
+                    graph.add_pool(
+                        PoolEdge(
+                            token_in=t_in,
+                            token_out=t_out,
+                            pool_address=pair_addr.lower(),
+                            protocol="UniswapV2",
+                            fee_bps=30,
+                            reserve_in=r_in,
+                            reserve_out=r_out,
+                            extra={"is_token0_in": t_in.address.lower() == token0_v2.lower()},
+                        )
+                    )
+
+    return graph
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 
 @router.post("/swap/quote")
-def get_quote(body: dict) -> dict:
+async def get_quote(body: dict) -> dict:
     """Compute an off-chain swap quote using the pydefi Router.
 
     Request body keys:
@@ -240,8 +349,31 @@ def get_quote(body: dict) -> dict:
     try:
         route = router_obj.find_best_route(TokenAmount(tok_in, amount_in_raw), tok_out)
         dag = router_obj.find_best_split(TokenAmount(tok_in, amount_in_raw), tok_out)
-    except NoRouteFoundError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+    except NoRouteFoundError:
+        # No indexed pool for this pair — try on-demand factory discovery if
+        # RPC_URL is configured, then retry routing once.
+        rpc_url = get_rpc_url()
+        if not rpc_url:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"No route found for {tok_in.symbol} → {tok_out.symbol}. "
+                    "Set RPC_URL to enable on-demand pool discovery for un-indexed pairs."
+                ),
+            )
+        graph = await _augment_graph_on_demand(graph, tok_in, tok_out, rpc_url)
+        router_obj = Router(graph)
+        try:
+            route = router_obj.find_best_route(TokenAmount(tok_in, amount_in_raw), tok_out)
+            dag = router_obj.find_best_split(TokenAmount(tok_in, amount_in_raw), tok_out)
+        except NoRouteFoundError:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"No route found for {tok_in.symbol} → {tok_out.symbol}. "
+                    f"No direct or indexed pool exists for this pair on chain {tok_in.chain_id}."
+                ),
+            )
 
     amount_out_raw = route.amount_out.amount
     quote = AggregatorQuote(

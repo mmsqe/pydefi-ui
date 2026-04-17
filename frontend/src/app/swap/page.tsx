@@ -181,7 +181,7 @@ export default function SwapPage() {
   const [quoteLoading, setQuoteLoading] = useState(false);
   const [quoteError, setQuoteError] = useState<string | null>(null);
 
-  const { address } = useAccount();
+  const { address, chain } = useAccount();
   const { data: pools } = useSWR<Pool[]>(`${BASE}/api/pools`, swrFetcher);
 
   const isNativeIn = tokenIn === "ETH";
@@ -329,13 +329,25 @@ export default function SwapPage() {
   // ---------------------------------------------------------------------------
   // Transaction
   // ---------------------------------------------------------------------------
-  const { mutateAsync: sendTx, isPending: txPending, data: txHash } = useSendTransaction();
-  const { isLoading: txConfirming, isSuccess: txConfirmed } = useWaitForTransactionReceipt({ hash: txHash });
+  const {
+    mutateAsync: sendTx,
+    isPending: txPending,
+    data: txHash,
+    error: txSendError,
+    reset: txReset,
+  } = useSendTransaction();
+  const {
+    isLoading: txConfirming,
+    data: receipt,
+  } = useWaitForTransactionReceipt({ hash: txHash });
+  const txSuccess = receipt?.status === "success";
+  const txReverted = receipt?.status === "reverted";
   const [txBuildError, setTxBuildError] = useState<string | null>(null);
 
   const handleBuildAndSign = async () => {
     if (!address || !quoteResult || !amountIn) return;
     setTxBuildError(null);
+    txReset();
     try {
       const res = await fetch(`${BASE}/api/swap/build`, {
         method: "POST",
@@ -355,7 +367,10 @@ export default function SwapPage() {
       const { to, data, value } = await res.json();
       await sendTx({ to, data, value: value ? BigInt(value) : isNativeIn ? parseEther(amountIn) : undefined });
     } catch (err) {
-      setTxBuildError(err instanceof Error ? err.message : "Failed to build transaction");
+      // Wallet rejections come through wagmi's error — don't double-report them
+      if (err instanceof Error && !err.message.includes("User rejected")) {
+        setTxBuildError(err instanceof Error ? err.message : "Failed to build transaction");
+      }
     }
   };
 
@@ -368,6 +383,8 @@ export default function SwapPage() {
     : txPending ? "Check wallet…"
     : "Build & Sign";
   const buildEnabled = !!address && !exceedsBalance && !!amountIn && !!quoteResult && !quoteLoading && !txPending && !txConfirming;
+
+  const explorerBase = chain?.blockExplorers?.default?.url ?? "https://etherscan.io";
 
   // Price impact display
   const impactNum = priceImpact && priceImpact !== "NaN" ? parseFloat(priceImpact) * 100 : null;
@@ -485,8 +502,8 @@ export default function SwapPage() {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <p className="text-xs text-muted mb-1 uppercase tracking-wider">Slippage</p>
-              <div className="flex items-center gap-1.5">
-                {["0.1", "0.5", "1.0"].map((v) => (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {["0.5", "1.0", "5.0", "50"].map((v) => (
                   <button
                     key={v}
                     onClick={() => setSlippage(v)}
@@ -499,6 +516,16 @@ export default function SwapPage() {
                     {v}%
                   </button>
                 ))}
+                <input
+                  type="number"
+                  min="0.01"
+                  max="100"
+                  step="0.1"
+                  value={["0.5","1.0","5.0","50"].includes(slippage) ? "" : slippage}
+                  onChange={(e) => e.target.value && setSlippage(e.target.value)}
+                  placeholder="custom"
+                  className="w-16 bg-transparent border border-border-dim rounded-lg px-2 py-1 text-xs text-[#e8eaf0] placeholder-muted focus:outline-none focus:border-cyan/40"
+                />
               </div>
             </div>
             <div>
@@ -519,24 +546,79 @@ export default function SwapPage() {
             {buildLabel}
           </Button>
 
+          {/* Build / API error */}
           {txBuildError && (
             <div className="flex items-start gap-2 bg-red-500/8 border border-red-500/20 rounded-xl p-3">
               <AlertCircle size={14} className="text-red-400 mt-0.5 flex-shrink-0" />
-              <p className="text-xs text-red-400">{txBuildError}</p>
+              <p className="text-xs text-red-400 break-all">{txBuildError}</p>
             </div>
           )}
 
-          {txConfirmed && txHash && (
+          {/* Wallet rejected */}
+          {txSendError && !txBuildError && (
+            <div className="flex items-start gap-2 bg-red-500/8 border border-red-500/20 rounded-xl p-3">
+              <AlertCircle size={14} className="text-red-400 mt-0.5 flex-shrink-0" />
+              <p className="text-xs text-red-400">
+                {txSendError.message.includes("User rejected")
+                  ? "Transaction rejected in wallet."
+                  : txSendError.message}
+              </p>
+            </div>
+          )}
+
+          {/* Pending confirmation */}
+          {txConfirming && txHash && (
+            <div className="flex items-center justify-between bg-amber-500/8 border border-amber-500/20 rounded-xl px-4 py-3">
+              <div className="flex items-center gap-2">
+                <Loader size={13} className="animate-spin text-amber-400" />
+                <span className="text-xs text-amber-300 font-semibold">Waiting for confirmation…</span>
+              </div>
+              <a
+                href={`${explorerBase}/tx/${txHash}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 text-xs text-muted hover:text-cyan transition-colors font-mono"
+              >
+                {txHash.slice(0, 10)}… <ExternalLink size={11} />
+              </a>
+            </div>
+          )}
+
+          {/* On-chain revert */}
+          {txReverted && txHash && (
+            <div className="flex items-start justify-between bg-red-500/8 border border-red-500/20 rounded-xl px-4 py-3 gap-3">
+              <div className="flex items-start gap-2 min-w-0">
+                <AlertCircle size={14} className="text-red-400 mt-0.5 flex-shrink-0" />
+                <div>
+                  <p className="text-xs text-red-400 font-semibold">Transaction reverted</p>
+                  <p className="text-[10px] text-red-400/70 mt-0.5">
+                    The swap was rejected on-chain. Try increasing slippage tolerance.
+                  </p>
+                </div>
+              </div>
+              <a
+                href={`${explorerBase}/tx/${txHash}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 text-xs text-muted hover:text-cyan transition-colors font-mono flex-shrink-0 mt-0.5"
+              >
+                {txHash.slice(0, 10)}… <ExternalLink size={11} />
+              </a>
+            </div>
+          )}
+
+          {/* Success */}
+          {txSuccess && txHash && (
             <div className="flex items-center justify-between bg-green/8 border border-green/20 rounded-xl px-4 py-3">
               <div className="flex items-center gap-2">
                 <CheckCircle size={14} className="text-green" />
                 <span className="text-xs text-green font-semibold">Transaction confirmed</span>
               </div>
               <a
-                href={`https://etherscan.io/tx/${txHash}`}
+                href={`${explorerBase}/tx/${txHash}`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="flex items-center gap-1 text-xs text-muted hover:text-cyan transition-colors"
+                className="flex items-center gap-1 text-xs text-muted hover:text-cyan transition-colors font-mono"
               >
                 {txHash.slice(0, 10)}… <ExternalLink size={11} />
               </a>

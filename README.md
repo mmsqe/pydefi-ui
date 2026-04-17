@@ -14,11 +14,18 @@ Next.js 14 + FastAPI dashboard for the pydefi AMM pool indexer.
 ```bash
 uv sync
 
-# Start API server — DB_PATH is required
-DB_PATH=/path/to/pools.db uv run uvicorn backend.main:app --reload
+# DB_PATH is required; DEFI_VM_ADDRESS enables swap/build
+DB_PATH=/path/to/pools.db \
+  DEFI_VM_ADDRESS=0x<deployed-defi-vm> \
+  uv run uvicorn backend.main:app --reload
 ```
 
-Optional: set `RPC_URL` for backfill operations.
+| Env var | Required | Purpose |
+|---|---|---|
+| `DB_PATH` | yes | Path to the SQLite pool database |
+| `DEFI_VM_ADDRESS` | for swap/build | Deployed DeFiVM contract address |
+| `RPC_URL` | recommended | JSON-RPC endpoint — enables on-chain quote in swap/build and indexer backfill |
+| `V3_QUOTER_ADDRESS` | optional | Override the per-chain QuoterV2 default used by swap/build |
 
 ```bash
 DB_PATH=... RPC_URL=https://mainnet.infura.io/v3/<key> uv run uvicorn backend.main:app --reload

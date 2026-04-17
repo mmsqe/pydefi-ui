@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useAccount } from "wagmi";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import {
@@ -101,11 +102,16 @@ interface BlockConfig {
   call_value?: string;
 }
 
+interface DAGSwap { type: "swap"; token_out: string; pool_address: string; protocol: string; fee_bps: number; }
+interface DAGSplit { type: "split"; token_out: string; legs: { fraction_bps: number; actions: DAGAction[] }[]; }
+type DAGAction = DAGSwap | DAGSplit;
+interface RouteDAGData { token_in: string; actions: DAGAction[]; }
+
 interface QuoteState {
   loading: boolean;
   amount_out_human?: string;
   price_impact?: string;
-  route?: { token_in: string; token_out: string; protocol: string; fee_bps: number }[];
+  dag?: RouteDAGData;
   error?: string;
 }
 
@@ -184,8 +190,9 @@ function assemblePseudo(
           : "";
         lines.push(`; build_multi_hop_program(swap_route_to_hops(route, defi_vm, sender))`);
         lines.push(`SWAP  ${c.amount_in ?? "?"} ${c.token_in ?? "?"} → ${c.token_out ?? "?"}${minOut}`);
-        if (q?.route) {
-          q.route.forEach((s) => {
+        if (q?.dag) {
+          const swaps = q.dag.actions.filter((a): a is DAGSwap => a.type === "swap");
+          swaps.forEach((s) => {
             lines.push(`        via ${s.protocol} pool  fee=${s.fee_bps / 100}%`);
           });
         }
@@ -394,18 +401,31 @@ function BlockConfigForm({
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function ProgramBuilderPage() {
+  const { address: walletAddress } = useAccount();
+
   const [blocks, setBlocks] = useState<CanvasBlock[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [pools, setPools] = useState<Pool[]>([]);
   const [quotes, setQuotes] = useState<Record<string, QuoteState>>({});
   const [running, setRunning] = useState(false);
   const [runResult, setRunResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [sender, setSender] = useState("");
+  const [senderError, setSenderError] = useState(false);
+  const [invalidBlockId, setInvalidBlockId] = useState<string | null>(null);
   const quoteTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   // Load pools once for token symbol lists
   useEffect(() => {
     fetchPools().then(setPools).catch(() => {});
   }, []);
+
+  // Sync sender from connected wallet (user can still override manually)
+  useEffect(() => {
+    if (walletAddress) {
+      setSender(walletAddress);
+      setSenderError(false);
+    }
+  }, [walletAddress]);
 
   const symbols = useMemo(() => {
     const set = new Set<string>();
@@ -416,13 +436,32 @@ export default function ProgramBuilderPage() {
     return Array.from(set).sort();
   }, [pools]);
 
+  // Full token metadata keyed by symbol — used to send TokenRef objects to the API.
+  const tokenNodes = useMemo(() => {
+    const map: Record<string, { address: string; symbol: string; decimals: number; chain_id: number }> = {};
+    for (const p of pools) {
+      map[p.token0_symbol] ??= { address: p.token0_address, symbol: p.token0_symbol, decimals: p.token0_decimals, chain_id: p.chain_id };
+      map[p.token1_symbol] ??= { address: p.token1_address, symbol: p.token1_symbol, decimals: p.token1_decimals, chain_id: p.chain_id };
+    }
+    return map;
+  }, [pools]);
+
   // ── Block mutations ──────────────────────────────────────────────────────
 
   const addBlock = useCallback((type: BlockType) => {
     const id = `b-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    setBlocks((prev) => [...prev, { id, type, config: {} }]);
+    let config: BlockConfig = {};
+    if (type === "swap" && blocks.length > 0) {
+      const prev = blocks[blocks.length - 1];
+      if (prev.type === "wrap_eth") {
+        config = { token_in: "WETH" };
+      } else if (prev.type === "swap" && prev.config.token_out) {
+        config = { token_in: prev.config.token_out };
+      }
+    }
+    setBlocks((bs) => [...bs, { id, type, config }]);
     setExpanded(id);
-  }, []);
+  }, [blocks]);
 
   const removeBlock = useCallback((id: string) => {
     setBlocks((prev) => prev.filter((b) => b.id !== id));
@@ -443,6 +482,7 @@ export default function ProgramBuilderPage() {
   }, []);
 
   const updateConfig = useCallback((id: string, patch: Partial<BlockConfig>) => {
+    setInvalidBlockId((prev) => (prev === id ? null : prev));
     setBlocks((prev) =>
       prev.map((b) => (b.id === id ? { ...b, config: { ...b.config, ...patch } } : b))
     );
@@ -468,17 +508,19 @@ export default function ProgramBuilderPage() {
       }
 
       quoteTimers.current[id] = setTimeout(async () => {
+        const tokIn = tokenNodes[token_in];
+        const tokOut = tokenNodes[token_out];
+        if (!tokIn || !tokOut) return;
+
         setQuotes((q) => ({ ...q, [id]: { loading: true } }));
         try {
           const res = await fetch("/api/swap/quote", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              token_in,
-              token_out,
+              token_in: tokIn,
+              token_out: tokOut,
               amount_in,
-              is_native_in: token_in === "ETH",
-              is_native_out: token_out === "ETH",
             }),
           });
           if (!res.ok) {
@@ -494,7 +536,7 @@ export default function ProgramBuilderPage() {
               loading: false,
               amount_out_human: data.amount_out_human,
               price_impact: data.price_impact,
-              route: data.route,
+              dag: data.dag,
             },
           }));
         } catch (e: unknown) {
@@ -515,18 +557,57 @@ export default function ProgramBuilderPage() {
 
   const handleRun = useCallback(async () => {
     if (blocks.length === 0) return;
+
+    const swapBlocks = blocks.filter((b) => b.type === "swap");
+    if (swapBlocks.length === 0) {
+      setRunResult({ ok: false, message: "No Swap block in program. Add a Swap block to build calldata." });
+      return;
+    }
+    const swapBlock = swapBlocks[0];
+    const { token_in: symIn, token_out: symOut, amount_in, slippage_bps } = swapBlock.config;
+
+    // Highlight incomplete swap block and expand it for the user to fix
+    if (!symIn || !symOut || !amount_in || parseFloat(amount_in) <= 0) {
+      setInvalidBlockId(swapBlock.id);
+      setExpanded(swapBlock.id);
+      setRunResult({ ok: false, message: "Swap block is incomplete — fill in token_in, token_out, and amount_in." });
+      return;
+    }
+
+    // Highlight missing sender input
+    if (!sender.trim()) {
+      setSenderError(true);
+      setRunResult({ ok: false, message: "Connect your wallet or enter a sender address." });
+      return;
+    }
+
+    const tokIn = tokenNodes[symIn];
+    const tokOut = tokenNodes[symOut];
+    if (!tokIn || !tokOut) {
+      setInvalidBlockId(swapBlock.id);
+      setExpanded(swapBlock.id);
+      setRunResult({ ok: false, message: `Unknown token symbol: ${!tokIn ? symIn : symOut}` });
+      return;
+    }
+
+    setInvalidBlockId(null);
+    setSenderError(false);
     setRunning(true);
     setRunResult(null);
     try {
       const res = await fetch("/api/swap/build", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ steps: blocks.map((b) => ({ type: b.type, config: b.config })) }),
+        body: JSON.stringify({
+          token_in: tokIn,
+          token_out: tokOut,
+          amount_in,
+          slippage_bps: slippage_bps ? parseInt(slippage_bps) : 50,
+          sender: sender.trim(),
+        }),
       });
       const data = await res.json();
-      if (res.status === 501) {
-        setRunResult({ ok: false, message: data.detail ?? "DeFi VM integration pending — execution not yet available." });
-      } else if (!res.ok) {
+      if (!res.ok) {
         setRunResult({ ok: false, message: data.detail ?? res.statusText });
       } else {
         setRunResult({ ok: true, message: JSON.stringify(data, null, 2) });
@@ -536,7 +617,7 @@ export default function ProgramBuilderPage() {
     } finally {
       setRunning(false);
     }
-  }, [blocks]);
+  }, [blocks, tokenNodes, sender]);
 
   const pseudocode = useMemo(() => assemblePseudo(blocks, quotes), [blocks, quotes]);
 
@@ -589,8 +670,20 @@ export default function ProgramBuilderPage() {
         <Card className="lg:col-span-3 flex flex-col">
           <CardHeader>
             <CardTitle>Canvas</CardTitle>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs text-muted">{blocks.length} step{blocks.length !== 1 ? "s" : ""}</span>
+              <input
+                type="text"
+                placeholder="Sender wallet 0x…"
+                value={sender}
+                onChange={(e) => { setSender(e.target.value); setSenderError(false); }}
+                className={cn(
+                  "bg-[#0d1117] border rounded-lg px-2.5 py-1 text-xs text-[#e8eaf0] focus:outline-none font-mono w-52 transition-colors",
+                  senderError && !sender.trim()
+                    ? "border-red-500/70 focus:border-red-500"
+                    : "border-border-dim focus:border-cyan/40"
+                )}
+              />
               <button
                 onClick={handleRun}
                 disabled={running || blocks.length === 0}
@@ -636,7 +729,12 @@ export default function ProgramBuilderPage() {
                         className="border rounded-xl transition-all"
                         style={{
                           backgroundColor: `${def.color}06`,
-                          borderColor: isExpanded ? `${def.color}40` : `${def.color}18`,
+                          borderColor:
+                            invalidBlockId === block.id
+                              ? "#ef444460"
+                              : isExpanded
+                              ? `${def.color}40`
+                              : `${def.color}18`,
                         }}
                       >
                         {/* Header row */}

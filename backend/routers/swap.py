@@ -339,9 +339,11 @@ async def build_swap(body: dict) -> dict:
     on_chain_quote_note: str = ""
     amount_out_for_slippage: int = route.amount_out.amount
 
-    # ── On-chain quote via QuoterV2 (V3-only routes) ──────────────────────────
-    is_all_v3 = all("v3" in s.protocol.lower() for s in route.steps)
-    if rpc_url and is_all_v3:
+    # ── On-chain quote via DeFiVM eth_call (V2 + V3 routes) ─────────────────────
+    # quote_swap_transaction composes a DeFiVM program that:
+    #   V2 hops — pair.getReserves() + constant-product formula (live reserves)
+    #   V3 hops — quoter.quoteExactInput per hop
+    if rpc_url:
         quoter_address = os.environ.get("V3_QUOTER_ADDRESS", "").strip() or _get_v3_quoter(tok_in.chain_id)
         if quoter_address:
             try:
@@ -353,13 +355,11 @@ async def build_swap(body: dict) -> dict:
                     amount_out_for_slippage = on_chain.amount
                     on_chain_quote_used = True
             except Exception as exc:
-                on_chain_quote_note = f"on-chain V3 quote failed ({exc}); using indexed estimate"
+                on_chain_quote_note = f"on-chain quote failed ({exc}); using indexed estimate"
         else:
             on_chain_quote_note = "no V3 quoter address for this chain; using indexed estimate"
-    elif not rpc_url:
+    else:
         on_chain_quote_note = "RPC_URL not set; using indexed estimate (set RPC_URL for accurate slippage)"
-    elif not is_all_v3:
-        on_chain_quote_note = "route contains non-V3 hops; on-chain quote not supported, using indexed estimate"
 
     min_final_out = amount_out_for_slippage * (10_000 - slippage_bps) // 10_000
 

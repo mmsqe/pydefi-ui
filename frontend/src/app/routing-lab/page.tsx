@@ -34,6 +34,7 @@ interface TokenNode {
   symbol: string;
   address: string;
   decimals: number;
+  chain_id: number;
 }
 
 interface GraphEdge {
@@ -44,13 +45,25 @@ interface GraphEdge {
   fee_bps: number;
 }
 
-interface RouteStep {
-  token_in: string;
+interface DAGSwap {
+  type: "swap";
   token_out: string;
   pool_address: string;
   protocol: string;
   fee_bps: number;
-  pct: number;
+}
+
+interface DAGSplit {
+  type: "split";
+  token_out: string;
+  legs: { fraction_bps: number; actions: DAGAction[] }[];
+}
+
+type DAGAction = DAGSwap | DAGSplit;
+
+interface RouteDAGData {
+  token_in: string;
+  actions: DAGAction[];
 }
 
 interface QuoteResult {
@@ -59,7 +72,17 @@ interface QuoteResult {
   price_impact: string;
   token_in: string;
   token_out: string;
-  route: RouteStep[];
+  dag: RouteDAGData;
+}
+
+/** Collect all pool_address values from a DAG recursively. */
+function dagPoolAddresses(actions: DAGAction[]): string[] {
+  const out: string[] = [];
+  for (const a of actions) {
+    if (a.type === "swap") out.push(a.pool_address);
+    else if (a.type === "split") a.legs.forEach((l) => out.push(...dagPoolAddresses(l.actions)));
+  }
+  return out;
 }
 
 // ── Layout helpers ───────────────────────────────────────────────────────────
@@ -132,11 +155,13 @@ export default function RoutingLabPage() {
         symbol: p.token0_symbol,
         address: p.token0_address,
         decimals: p.token0_decimals,
+        chain_id: p.chain_id,
       };
       tokenNodes[p.token1_symbol] ??= {
         symbol: p.token1_symbol,
         address: p.token1_address,
         decimals: p.token1_decimals,
+        chain_id: p.chain_id,
       };
       edges.push({
         pool_address: p.pool_address,
@@ -236,6 +261,9 @@ export default function RoutingLabPage() {
     if (!selectedIn || !selectedOut) return;
     const amt = parseFloat(amountIn);
     if (!amountIn || isNaN(amt) || amt <= 0) return;
+    const tokIn = tokenNodes[selectedIn];
+    const tokOut = tokenNodes[selectedOut];
+    if (!tokIn || !tokOut) return;
 
     setQuoting(true);
     setQuoteError(null);
@@ -244,11 +272,9 @@ export default function RoutingLabPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          token_in: selectedIn,
-          token_out: selectedOut,
+          token_in: tokIn,
+          token_out: tokOut,
           amount_in: amountIn,
-          is_native_in: selectedIn === "ETH",
-          is_native_out: selectedOut === "ETH",
         }),
       });
       if (!res.ok) {
@@ -264,7 +290,7 @@ export default function RoutingLabPage() {
     } finally {
       setQuoting(false);
     }
-  }, [selectedIn, selectedOut, amountIn]);
+  }, [selectedIn, selectedOut, amountIn, tokenNodes]);
 
   useEffect(() => {
     if (!selectedIn || !selectedOut) return;
@@ -275,7 +301,7 @@ export default function RoutingLabPage() {
   // ── Highlight active route edges ───────────────────────────────────────────
 
   const routePoolSet = useMemo<Set<string>>(
-    () => new Set(quote?.route.map((s) => s.pool_address) ?? []),
+    () => new Set(quote ? dagPoolAddresses(quote.dag.actions) : []),
     [quote],
   );
 
@@ -570,38 +596,38 @@ export default function RoutingLabPage() {
                   </div>
                 )}
 
-                {/* Route steps */}
+                {/* Route steps from DAG */}
                 <div className="pt-2 border-t border-border-dim/60 space-y-2">
                   <p className="text-[10px] text-muted uppercase tracking-wider">Route</p>
-                  {quote.route.map((step, i) => (
-                    <div key={i} className="flex items-center gap-2 text-xs">
-                      <span
-                        className="font-mono"
-                        style={{ color: tokenColor(step.token_in) }}
-                      >
-                        {step.token_in}
-                      </span>
-                      <ArrowRight size={10} className="text-muted flex-shrink-0" />
-                      <span
-                        className="font-mono"
-                        style={{ color: tokenColor(step.token_out) }}
-                      >
-                        {step.token_out}
-                      </span>
-                      <span
-                        className="text-[10px] font-mono ml-auto px-1.5 py-0.5 rounded"
-                        style={{
-                          color: protocolColor(step.protocol),
-                          backgroundColor: `${protocolColor(step.protocol)}15`,
-                        }}
-                      >
-                        {step.protocol} {step.fee_bps / 100}%
-                      </span>
-                      {step.pct < 100 && (
-                        <span className="text-[10px] text-cyan font-mono">{step.pct}%</span>
-                      )}
-                    </div>
-                  ))}
+                  {dagPoolAddresses(quote.dag.actions).length === 0 && (
+                    <p className="text-xs text-muted">No swaps in route.</p>
+                  )}
+                  {(function renderActions(actions: DAGAction[], tokenIn: string) {
+                    return actions.map((action, i) => {
+                      if (action.type === "swap") {
+                        return (
+                          <div key={i} className="flex items-center gap-2 text-xs">
+                            <span className="font-mono" style={{ color: tokenColor(tokenIn) }}>{tokenIn}</span>
+                            <ArrowRight size={10} className="text-muted flex-shrink-0" />
+                            <span className="font-mono" style={{ color: tokenColor(action.token_out) }}>{action.token_out}</span>
+                            <span
+                              className="text-[10px] font-mono ml-auto px-1.5 py-0.5 rounded"
+                              style={{ color: protocolColor(action.protocol), backgroundColor: `${protocolColor(action.protocol)}15` }}
+                            >
+                              {action.protocol} {action.fee_bps / 100}%
+                            </span>
+                          </div>
+                        );
+                      }
+                      // split
+                      return action.legs.map((leg, j) => (
+                        <div key={`${i}-${j}`} className="pl-3 border-l border-border-dim/40 space-y-1">
+                          <span className="text-[10px] text-cyan font-mono">{leg.fraction_bps / 100}%</span>
+                          {renderActions(leg.actions, tokenIn)}
+                        </div>
+                      ));
+                    });
+                  })(quote.dag.actions, quote.dag.token_in)}
                 </div>
               </div>
             )}

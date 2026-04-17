@@ -54,23 +54,6 @@ export interface IndexerStateItem {
   last_indexed_block: number;
 }
 
-// Matches backend AddPoolBody exactly
-export interface AddPoolBody {
-  pool_address: string;
-  protocol: string;
-  token0_address: string;
-  token0_symbol: string;
-  token0_decimals: number;
-  token1_address: string;
-  token1_symbol: string;
-  token1_decimals: number;
-  chain_id: number;
-  fee_bps: number;
-}
-
-export type AddV2PoolBody = AddPoolBody;
-export type AddV3PoolBody = AddPoolBody;
-
 export interface AddFactoryBody {
   factory_address: string;
   protocol: string;
@@ -86,40 +69,20 @@ export interface RunBackfillBody {
 
 // ── Swap ─────────────────────────────────────────────────────────────────────
 
-export interface QuoteRouteStep {
-  token_in: string;
-  token_out: string;
-  pool_address: string;
-  protocol: string;
-  fee_bps: number;
-  pct: number;
+/** Mirrors pydefi's Token dataclass — sent as token_in / token_out in swap requests. */
+export interface TokenRef {
+  address: string;
+  symbol: string;
+  decimals: number;
+  chain_id: number;
 }
 
-export interface QuoteBody {
-  token_in: string;
-  token_out: string;
-  amount_in: string;
+export interface SwapRequest {
+  token_in: TokenRef;
+  token_out: TokenRef;
+  amount_in: string;     // human-readable, e.g. "0.1"
   is_native_in?: boolean;
-  is_native_out?: boolean;
-  chain_id?: number;
-}
-
-export interface QuoteResult {
-  amount_out: string;
-  amount_out_human: string;
-  price_impact: string;
-  token_in: string;
-  token_out: string;
-  route: QuoteRouteStep[];
-}
-
-export interface BuildBody {
-  token_in: string;
-  token_out: string;
-  amount_in: string;
-  amount_out_min: string;
+  // build-only fields
   slippage_bps?: number;
-  sender: string;
-  is_native_in?: boolean;
-  is_native_out?: boolean;
+  sender?: string;
 }

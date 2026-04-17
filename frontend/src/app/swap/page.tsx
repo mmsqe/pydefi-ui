@@ -97,17 +97,22 @@ function PoolHopNode({ action, color }: { action: DAGSwap; color: string }) {
 
 /** Renders a flat sequence of swap actions as a horizontal hop chain. */
 function LegChain({ tokenIn, actions, color }: { tokenIn: string; actions: DAGAction[]; color: string }) {
-  const nodes: React.ReactNode[] = [<TokenNode key="in" symbol={tokenIn} color={color} />];
-  actions.forEach((action, i) => {
-    if (action.type === "swap") {
-      nodes.push(<span key={`a${i}`} className="text-muted text-xs">→</span>);
-      nodes.push(<PoolHopNode key={`p${i}`} action={action} color={color} />);
-      nodes.push(<span key={`b${i}`} className="text-muted text-xs">→</span>);
-      nodes.push(<TokenNode key={`t${i}`} symbol={action.token_out} color={color} />);
-    }
-    // nested splits rendered as opaque (rare in find_best_route_dag output)
-  });
-  return <div className="flex items-center gap-1.5 flex-wrap">{nodes}</div>;
+  const swaps = actions.filter((a): a is DAGSwap => a.type === "swap");
+  return (
+    <div className="overflow-x-auto">
+      <div className="flex items-center gap-1.5 min-w-max">
+        <TokenNode symbol={tokenIn} color={color} />
+        {swaps.map((action, i) => (
+          <div key={i} className="flex items-center gap-1.5 flex-shrink-0">
+            <span className="text-muted text-xs">→</span>
+            <PoolHopNode action={action} color={color} />
+            <span className="text-muted text-xs">→</span>
+            <TokenNode symbol={action.token_out} color={color} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function DAGVisualizer({ dag, isNativeIn }: { dag?: RouteDAGData | null; isNativeIn: boolean }) {
@@ -224,9 +229,9 @@ export default function SwapPage() {
     if (isNativeIn || !pools) return undefined;
     for (const p of pools) {
       if (p.token0_symbol === tokenIn)
-        return { address: p.token0_address as `0x${string}`, decimals: p.token0_decimals, symbol: p.token0_symbol };
+        return { address: p.token0_address as `0x${string}`, decimals: p.token0_decimals, symbol: p.token0_symbol, chain_id: p.chain_id };
       if (p.token1_symbol === tokenIn)
-        return { address: p.token1_address as `0x${string}`, decimals: p.token1_decimals, symbol: p.token1_symbol };
+        return { address: p.token1_address as `0x${string}`, decimals: p.token1_decimals, symbol: p.token1_symbol, chain_id: p.chain_id };
     }
   }, [pools, tokenIn, isNativeIn]);
 
@@ -234,11 +239,20 @@ export default function SwapPage() {
     if (isNativeOut || !pools) return undefined;
     for (const p of pools) {
       if (p.token0_symbol === tokenOut)
-        return { address: p.token0_address as `0x${string}`, decimals: p.token0_decimals, symbol: p.token0_symbol };
+        return { address: p.token0_address as `0x${string}`, decimals: p.token0_decimals, symbol: p.token0_symbol, chain_id: p.chain_id };
       if (p.token1_symbol === tokenOut)
-        return { address: p.token1_address as `0x${string}`, decimals: p.token1_decimals, symbol: p.token1_symbol };
+        return { address: p.token1_address as `0x${string}`, decimals: p.token1_decimals, symbol: p.token1_symbol, chain_id: p.chain_id };
     }
   }, [pools, tokenOut, isNativeOut]);
+
+  // WETH metadata — used as token_in when swapping native ETH.
+  const wethMeta = useMemo(() => {
+    if (!pools) return undefined;
+    for (const p of pools) {
+      if (p.token0_symbol === "WETH") return { address: p.token0_address, symbol: "WETH", decimals: p.token0_decimals, chain_id: p.chain_id };
+      if (p.token1_symbol === "WETH") return { address: p.token1_address, symbol: "WETH", decimals: p.token1_decimals, chain_id: p.chain_id };
+    }
+  }, [pools]);
 
   // Balances
   const { data: ethBalance, isLoading: ethBalanceLoading } = useBalance({
@@ -292,7 +306,11 @@ export default function SwapPage() {
   // Auto-quote: fires 500 ms after the user stops typing, or on token change.
   // ---------------------------------------------------------------------------
   const fetchQuote = useCallback(
-    async (amount: string, tIn: string, tOut: string, nativeIn: boolean, nativeOut: boolean) => {
+    async (amount: string, nativeIn: boolean, nativeOut: boolean) => {
+      const tokenInRef = nativeIn ? wethMeta : tokenInMeta;
+      const tokenOutRef = nativeOut ? wethMeta : tokenOutMeta;
+      if (!tokenInRef || !tokenOutRef) return;
+
       setQuoteLoading(true);
       setQuoteError(null);
       try {
@@ -300,11 +318,10 @@ export default function SwapPage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            token_in: tIn,
-            token_out: tOut,
+            token_in: tokenInRef,
+            token_out: tokenOutRef,
             amount_in: amount,
             is_native_in: nativeIn,
-            is_native_out: nativeOut,
           }),
         });
         if (!res.ok) {
@@ -328,7 +345,7 @@ export default function SwapPage() {
         setQuoteLoading(false);
       }
     },
-    []
+    [wethMeta, tokenInMeta, tokenOutMeta]
   );
 
   useEffect(() => {
@@ -341,7 +358,7 @@ export default function SwapPage() {
       return;
     }
     const timer = setTimeout(
-      () => fetchQuote(amountIn, tokenIn, tokenOut, isNativeIn, isNativeOut),
+      () => fetchQuote(amountIn, isNativeIn, isNativeOut),
       500
     );
     return () => clearTimeout(timer);
@@ -366,7 +383,7 @@ export default function SwapPage() {
   const [txBuildError, setTxBuildError] = useState<string | null>(null);
 
   const handleBuildAndSign = async () => {
-    if (!address || !quoteResult || !amountIn) return;
+    if (!address || !quoteResult || !amountIn || !tokenInRef || !tokenOutRef) return;
     setTxBuildError(null);
     txReset();
     try {
@@ -374,14 +391,12 @@ export default function SwapPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          token_in: tokenIn,
-          token_out: tokenOut,
+          token_in: tokenInRef,
+          token_out: tokenOutRef,
           amount_in: amountIn,
-          amount_out_min: quoteResult,
           slippage_bps: Math.round(parseFloat(slippage) * 100),
           sender: address,
           is_native_in: isNativeIn,
-          is_native_out: isNativeOut,
         }),
       });
       if (!res.ok) throw new Error(await res.json().then((j) => j.detail).catch(() => res.statusText));
@@ -403,7 +418,9 @@ export default function SwapPage() {
     : txConfirming ? "Confirming…"
     : txPending ? "Check wallet…"
     : "Build & Sign";
-  const buildEnabled = !!address && !exceedsBalance && !!amountIn && !!quoteResult && !quoteLoading && !txPending && !txConfirming;
+  const tokenInRef = isNativeIn ? wethMeta : tokenInMeta;
+  const tokenOutRef = isNativeOut ? wethMeta : tokenOutMeta;
+  const buildEnabled = !!address && !exceedsBalance && !!amountIn && !!quoteResult && !quoteLoading && !txPending && !txConfirming && !!tokenInRef && !!tokenOutRef;
 
   const explorerBase = chain?.blockExplorers?.default?.url ?? "https://etherscan.io";
 

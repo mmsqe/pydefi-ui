@@ -16,7 +16,6 @@ from typing import Any, Optional
 
 import sqlalchemy as sa
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 from pydefi.indexer.models import Pool, V2SyncEvent, V3SwapEvent
 from sqlmodel import Session, select
 
@@ -27,19 +26,6 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Request bodies
 # ---------------------------------------------------------------------------
-
-
-class AddPoolBody(BaseModel):
-    pool_address: str
-    protocol: str
-    token0_address: str
-    token0_symbol: str
-    token0_decimals: int
-    token1_address: str
-    token1_symbol: str
-    token1_decimals: int
-    chain_id: int
-    fee_bps: int = 30
 
 
 # ---------------------------------------------------------------------------
@@ -235,42 +221,41 @@ def get_pool_history(address: str, limit: int = 500) -> list[dict]:
     return rows
 
 
+def _pool_fields_from_body(body: dict) -> dict:
+    """Extract and validate pool registration fields from a request dict."""
+    try:
+        return {
+            "pool_address": str(body["pool_address"]),
+            "protocol": str(body["protocol"]),
+            "token0_address": str(body["token0_address"]),
+            "token0_symbol": str(body["token0_symbol"]),
+            "token0_decimals": int(body["token0_decimals"]),
+            "token1_address": str(body["token1_address"]),
+            "token1_symbol": str(body["token1_symbol"]),
+            "token1_decimals": int(body["token1_decimals"]),
+            "chain_id": int(body["chain_id"]),
+            "fee_bps": int(body.get("fee_bps", 30)),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid pool body: {exc}")
+
+
 @router.post("/pools/v2", status_code=201)
-def add_v2_pool(body: AddPoolBody) -> dict:
+def add_v2_pool(body: dict) -> dict:
     """Register a Uniswap V2-compatible pool."""
+    fields = _pool_fields_from_body(body)
     indexer = get_indexer()
-    indexer.add_v2_pool(
-        pool_address=body.pool_address,
-        protocol=body.protocol,
-        token0_address=body.token0_address,
-        token0_symbol=body.token0_symbol,
-        token0_decimals=body.token0_decimals,
-        token1_address=body.token1_address,
-        token1_symbol=body.token1_symbol,
-        token1_decimals=body.token1_decimals,
-        chain_id=body.chain_id,
-        fee_bps=body.fee_bps,
-    )
-    return {"status": "ok", "pool_address": body.pool_address.lower()}
+    indexer.add_v2_pool(**fields)
+    return {"status": "ok", "pool_address": fields["pool_address"].lower()}
 
 
 @router.post("/pools/v3", status_code=201)
-def add_v3_pool(body: AddPoolBody) -> dict:
+def add_v3_pool(body: dict) -> dict:
     """Register a Uniswap V3-compatible pool."""
+    fields = _pool_fields_from_body(body)
     indexer = get_indexer()
-    indexer.add_v3_pool(
-        pool_address=body.pool_address,
-        protocol=body.protocol,
-        token0_address=body.token0_address,
-        token0_symbol=body.token0_symbol,
-        token0_decimals=body.token0_decimals,
-        token1_address=body.token1_address,
-        token1_symbol=body.token1_symbol,
-        token1_decimals=body.token1_decimals,
-        chain_id=body.chain_id,
-        fee_bps=body.fee_bps,
-    )
-    return {"status": "ok", "pool_address": body.pool_address.lower()}
+    indexer.add_v3_pool(**fields)
+    return {"status": "ok", "pool_address": fields["pool_address"].lower()}
 
 
 @router.delete("/pools/{address}", status_code=200)

@@ -4,13 +4,9 @@ import type {
   PoolHistory,
   Stats,
   IndexerStateItem,
-  AddV2PoolBody,
-  AddV3PoolBody,
   AddFactoryBody,
   RunBackfillBody,
-  QuoteBody,
-  QuoteResult,
-  BuildBody,
+  SwapRequest,
 } from "./types";
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -70,14 +66,14 @@ export async function fetchIndexerState(): Promise<IndexerStateItem[]> {
 
 // ── Write endpoints ─────────────────────────────────────────────────────────
 
-export async function addV2Pool(body: AddV2PoolBody): Promise<Pool> {
+export async function addV2Pool(body: Omit<Pool, "last_indexed_block">): Promise<Pool> {
   return apiFetch<Pool>("/api/pools/v2", {
     method: "POST",
     body: JSON.stringify(body),
   });
 }
 
-export async function addV3Pool(body: AddV3PoolBody): Promise<Pool> {
+export async function addV3Pool(body: Omit<Pool, "last_indexed_block">): Promise<Pool> {
   return apiFetch<Pool>("/api/pools/v3", {
     method: "POST",
     body: JSON.stringify(body),
@@ -102,15 +98,15 @@ export async function runBackfill(
 
 // ── Swap endpoints ───────────────────────────────────────────────────────────
 
-export async function fetchQuote(body: QuoteBody): Promise<QuoteResult> {
-  return apiFetch<QuoteResult>("/api/swap/quote", {
+export async function fetchQuote(body: SwapRequest): Promise<Record<string, unknown>> {
+  return apiFetch<Record<string, unknown>>("/api/swap/quote", {
     method: "POST",
     body: JSON.stringify(body),
   });
 }
 
-export async function buildSwap(body: BuildBody): Promise<unknown> {
-  return apiFetch<unknown>("/api/swap/build", {
+export async function buildSwap(body: SwapRequest): Promise<Record<string, unknown>> {
+  return apiFetch<Record<string, unknown>>("/api/swap/build", {
     method: "POST",
     body: JSON.stringify(body),
   });

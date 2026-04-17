@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import os
 from decimal import Decimal, InvalidOperation
-from typing import Optional
 
 from eth_contract import Contract
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydefi.aggregator.base import AggregatorQuote
 from pydefi.deployments import get_address
 from pydefi.exceptions import NoRouteFoundError
 from pydefi.indexer.models import Pool, V2SyncEvent, V3SwapEvent
@@ -29,14 +28,11 @@ from backend.deps import get_indexer, get_rpc_url
 
 router = APIRouter()
 
-# Sentinel used by pydefi for native ETH
-_NATIVE_ADDRESS = Token.NATIVE_ADDRESS
-
 # Chains not yet in pydefi/deployments.py — residual fallback only.
 _V3_QUOTER_EXTRA: dict[int, str] = {
-    8453:  "0x3d4e44Eb1374240CE5F1B136041212047e93690c",  # Base
+    8453: "0x3d4e44Eb1374240CE5F1B136041212047e93690c",  # Base
     42161: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",  # Arbitrum
-    137:   "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",  # Polygon
+    137: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",  # Polygon
 }
 
 
@@ -53,62 +49,50 @@ def _get_v3_quoter(chain_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Request / response bodies
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-class QuoteBody(BaseModel):
-    token_in: str  # symbol or "ETH"
-    token_out: str  # symbol or "ETH"
-    amount_in: str  # human-readable, e.g. "0.1"
-    is_native_in: bool = False
-    is_native_out: bool = False
-    chain_id: Optional[int] = None
+def _token_from_body(data: dict) -> Token:
+    """Build a pydefi :class:`~pydefi.types.Token` from a request token dict.
+
+    Expected keys: ``address``, ``symbol``, ``decimals``, ``chain_id``.
+    """
+    try:
+        return Token(
+            chain_id=int(data["chain_id"]),
+            address=str(data["address"]).lower(),
+            symbol=str(data["symbol"]),
+            decimals=int(data["decimals"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid token object: {exc}")
 
 
-class BuildBody(BaseModel):
-    token_in: str
-    token_out: str
-    amount_in: str
-    amount_out_min: str
-    slippage_bps: int = 50
-    sender: str
-    is_native_in: bool = False
-    is_native_out: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Graph builder
-# ---------------------------------------------------------------------------
-
-
-def _build_graph(
-    session: Session,
-    pools: list[Pool],
-) -> tuple[PoolGraph, dict[str, Token]]:
-    """Build a PoolGraph from indexed pool data with the latest reserve state."""
+def _build_graph(session: Session, pools: list[Pool]) -> PoolGraph:
+    """Build a :class:`~pydefi.pathfinder.graph.PoolGraph` from indexed pool data."""
     graph = PoolGraph()
-    token_registry: dict[str, Token] = {}
-    token_by_symbol: dict[str, Token] = {}
-
-    def _get_or_create(address: str, symbol: str, decimals: int, chain_id: int) -> Token:
-        key = address.lower()
-        if key not in token_registry:
-            tok = Token(chain_id=chain_id, address=address, symbol=symbol, decimals=decimals)
-            token_registry[key] = tok
-            token_by_symbol.setdefault(symbol, tok)
-        return token_registry[key]
 
     for pool in pools:
         addr = pool.pool_address.lower()
         protocol = (pool.protocol or "unknown").lower()
         fee_bps = pool.fee_bps or 30
 
-        t0 = _get_or_create(pool.token0_address, pool.token0_symbol, pool.token0_decimals, pool.chain_id)
-        t1 = _get_or_create(pool.token1_address, pool.token1_symbol, pool.token1_decimals, pool.chain_id)
+        t0 = Token(
+            chain_id=pool.chain_id,
+            address=pool.token0_address,
+            symbol=pool.token0_symbol,
+            decimals=pool.token0_decimals,
+        )
+        t1 = Token(
+            chain_id=pool.chain_id,
+            address=pool.token1_address,
+            symbol=pool.token1_symbol,
+            decimals=pool.token1_decimals,
+        )
 
         if protocol in ("v2", "sushiswap", "uniswapv2"):
-            ev: Optional[V2SyncEvent] = session.exec(
+            ev = session.exec(
                 select(V2SyncEvent)
                 .where(V2SyncEvent.pool_address == addr)
                 .order_by(V2SyncEvent.block_number.desc(), V2SyncEvent.log_index.desc())
@@ -116,21 +100,34 @@ def _build_graph(
             ).first()
             if ev is None or ev.reserve0 == 0 or ev.reserve1 == 0:
                 continue
-            graph.add_pool(PoolEdge(
-                token_in=t0, token_out=t1, pool_address=addr, protocol=protocol,
-                reserve_in=ev.reserve0, reserve_out=ev.reserve1, fee_bps=fee_bps,
-                extra={"is_token0_in": True},
-            ))
-            graph.add_pool(PoolEdge(
-                token_in=t1, token_out=t0, pool_address=addr, protocol=protocol,
-                reserve_in=ev.reserve1, reserve_out=ev.reserve0, fee_bps=fee_bps,
-                extra={"is_token0_in": False},
-            ))
+            graph.add_pool(
+                PoolEdge(
+                    token_in=t0,
+                    token_out=t1,
+                    pool_address=addr,
+                    protocol=protocol,
+                    reserve_in=ev.reserve0,
+                    reserve_out=ev.reserve1,
+                    fee_bps=fee_bps,
+                    extra={"is_token0_in": True},
+                )
+            )
+            graph.add_pool(
+                PoolEdge(
+                    token_in=t1,
+                    token_out=t0,
+                    pool_address=addr,
+                    protocol=protocol,
+                    reserve_in=ev.reserve1,
+                    reserve_out=ev.reserve0,
+                    fee_bps=fee_bps,
+                    extra={"is_token0_in": False},
+                )
+            )
         elif "v4" in protocol:
-            # V4 pools are not yet supported for DeFiVM execution; skip them.
             continue
         else:
-            ev3: Optional[V3SwapEvent] = session.exec(
+            ev3 = session.exec(
                 select(V3SwapEvent)
                 .where(V3SwapEvent.pool_address == addr)
                 .order_by(V3SwapEvent.block_number.desc(), V3SwapEvent.log_index.desc())
@@ -138,18 +135,32 @@ def _build_graph(
             ).first()
             if ev3 is None or ev3.sqrt_price_x96 == 0 or ev3.liquidity == 0:
                 continue
-            graph.add_pool(V3PoolEdge(
-                token_in=t0, token_out=t1, pool_address=addr, protocol=protocol,
-                fee_bps=fee_bps, sqrt_price_x96=ev3.sqrt_price_x96,
-                liquidity=ev3.liquidity, is_token0_in=True,
-            ))
-            graph.add_pool(V3PoolEdge(
-                token_in=t1, token_out=t0, pool_address=addr, protocol=protocol,
-                fee_bps=fee_bps, sqrt_price_x96=ev3.sqrt_price_x96,
-                liquidity=ev3.liquidity, is_token0_in=False,
-            ))
+            graph.add_pool(
+                V3PoolEdge(
+                    token_in=t0,
+                    token_out=t1,
+                    pool_address=addr,
+                    protocol=protocol,
+                    fee_bps=fee_bps,
+                    sqrt_price_x96=ev3.sqrt_price_x96,
+                    liquidity=ev3.liquidity,
+                    is_token0_in=True,
+                )
+            )
+            graph.add_pool(
+                V3PoolEdge(
+                    token_in=t1,
+                    token_out=t0,
+                    pool_address=addr,
+                    protocol=protocol,
+                    fee_bps=fee_bps,
+                    sqrt_price_x96=ev3.sqrt_price_x96,
+                    liquidity=ev3.liquidity,
+                    is_token0_in=False,
+                )
+            )
 
-    return graph, token_by_symbol
+    return graph
 
 
 # ---------------------------------------------------------------------------
@@ -165,22 +176,25 @@ def _serialize_dag(dag) -> dict:
         result = []
         for action in actions:
             if isinstance(action, RouteSwap):
-                result.append({
-                    "type": "swap",
-                    "token_out": action.token_out.symbol,
-                    "pool_address": action.pool.pool_address,
-                    "protocol": action.pool.protocol,
-                    "fee_bps": action.pool.fee_bps,
-                })
+                result.append(
+                    {
+                        "type": "swap",
+                        "token_out": action.token_out.symbol,
+                        "pool_address": action.pool.pool_address,
+                        "protocol": action.pool.protocol,
+                        "fee_bps": action.pool.fee_bps,
+                    }
+                )
             elif isinstance(action, RouteSplit):
-                result.append({
-                    "type": "split",
-                    "token_out": action.token_out.symbol,
-                    "legs": [
-                        {"fraction_bps": leg.fraction_bps, "actions": _actions(leg.actions)}
-                        for leg in action.legs
-                    ],
-                })
+                result.append(
+                    {
+                        "type": "split",
+                        "token_out": action.token_out.symbol,
+                        "legs": [
+                            {"fraction_bps": leg.fraction_bps, "actions": _actions(leg.actions)} for leg in action.legs
+                        ],
+                    }
+                )
         return result
 
     payload = dag.to_dict()
@@ -193,37 +207,34 @@ def _serialize_dag(dag) -> dict:
 
 
 @router.post("/swap/quote")
-def get_quote(body: QuoteBody) -> dict:
-    """Compute an off-chain swap quote using the pydefi Router."""
-    indexer = get_indexer()
+def get_quote(body: dict) -> dict:
+    """Compute an off-chain swap quote using the pydefi Router.
 
-    with Session(indexer._engine) as session:
-        pools = session.exec(select(Pool)).all()
-        graph, token_by_symbol = _build_graph(session, list(pools))
+    Request body keys:
+      - ``token_in``  / ``token_out``: ``{address, symbol, decimals, chain_id}``
+      - ``amount_in``: human-readable string, e.g. ``"0.1"``
+      - ``is_native_in`` / ``is_native_out``: bool (default ``false``)
+    """
+    tok_in = _token_from_body(body.get("token_in") or {})
+    tok_out = _token_from_body(body.get("token_out") or {})
+    amount_in_str = str(body.get("amount_in", ""))
 
-    if not token_by_symbol:
-        raise HTTPException(status_code=422, detail="No indexed pools with price data found. Run a backfill first.")
-
-    sym_in = "WETH" if body.is_native_in else body.token_in
-    sym_out = "WETH" if body.is_native_out else body.token_out
-
-    tok_in = token_by_symbol.get(sym_in)
-    tok_out = token_by_symbol.get(sym_out)
-
-    if tok_in is None:
-        raise HTTPException(status_code=422, detail=f"Token '{sym_in}' not found in any indexed pool.")
-    if tok_out is None:
-        raise HTTPException(status_code=422, detail=f"Token '{sym_out}' not found in any indexed pool.")
-    if tok_in.address.lower() == tok_out.address.lower():
+    if tok_in.address == tok_out.address:
         raise HTTPException(status_code=422, detail="token_in and token_out must be different.")
 
     try:
-        amount_in_raw = int(Decimal(body.amount_in) * Decimal(10 ** tok_in.decimals))
+        amount_in_raw = int(Decimal(amount_in_str) * Decimal(10**tok_in.decimals))
     except (InvalidOperation, ValueError):
-        raise HTTPException(status_code=422, detail=f"Invalid amount_in: {body.amount_in!r}")
-
+        raise HTTPException(status_code=422, detail=f"Invalid amount_in: {amount_in_str!r}")
     if amount_in_raw <= 0:
         raise HTTPException(status_code=422, detail="amount_in must be positive.")
+
+    indexer = get_indexer()
+    with Session(indexer._engine) as session:
+        pools = session.exec(select(Pool)).all()
+        if not pools:
+            raise HTTPException(status_code=422, detail="No indexed pools found. Run a backfill first.")
+        graph = _build_graph(session, list(pools))
 
     router_obj = Router(graph)
     try:
@@ -232,25 +243,39 @@ def get_quote(body: QuoteBody) -> dict:
     except NoRouteFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    amount_out_raw = route.amount_out.amount
-    amount_out_human = str(Decimal(amount_out_raw) / Decimal(10 ** tok_out.decimals))
+    quote = AggregatorQuote(
+        token_in=tok_in,
+        token_out=tok_out,
+        amount_in=TokenAmount(tok_in, amount_in_raw),
+        amount_out=route.amount_out,
+        min_amount_out=TokenAmount(tok_out, 0),
+        gas_estimate=0,
+        price_impact=route.price_impact,
+        protocol="pydefi-router",
+        route_summary=f"{tok_in.symbol} → {tok_out.symbol}",
+    )
 
-    price_impact = route.price_impact
-    price_impact_str = "NaN" if price_impact.is_nan() else str(price_impact.quantize(Decimal("0.000001")))
+    amount_out_raw = quote.amount_out.amount
+    amount_out_human = str(Decimal(amount_out_raw) / Decimal(10**tok_out.decimals))
+    price_impact_str = "NaN" if quote.price_impact.is_nan() else str(quote.price_impact.quantize(Decimal("0.000001")))
 
     return {
         "amount_out": str(amount_out_raw),
         "amount_out_human": amount_out_human,
         "price_impact": price_impact_str,
-        "token_in": body.token_in,
-        "token_out": body.token_out,
+        "token_in": tok_in.symbol,
+        "token_out": tok_out.symbol,
         "dag": _serialize_dag(dag),
     }
 
 
 @router.post("/swap/build")
-async def build_swap(body: BuildBody) -> dict:
+async def build_swap(body: dict) -> dict:
     """Compile DeFiVM execute() calldata for a swap.
+
+    Request body keys (in addition to quote fields):
+      - ``slippage_bps``: int, default ``50``
+      - ``sender``: checksummed wallet address
 
     Steps:
     1. Build PoolGraph from indexed state → find best route (off-chain).
@@ -270,39 +295,36 @@ async def build_swap(body: BuildBody) -> dict:
         raise HTTPException(
             status_code=503,
             detail=(
-                "DEFI_VM_ADDRESS environment variable is not set. "
-                "Set it to your deployed DeFiVM contract address."
+                "DEFI_VM_ADDRESS environment variable is not set. Set it to your deployed DeFiVM contract address."
             ),
         )
+
+    tok_in = _token_from_body(body.get("token_in") or {})
+    tok_out = _token_from_body(body.get("token_out") or {})
+    is_native_in = bool(body.get("is_native_in", False))
+    slippage_bps = int(body.get("slippage_bps", 50))
+    sender = str(body.get("sender", ""))
+    amount_in_str = str(body.get("amount_in", ""))
+
+    if not sender:
+        raise HTTPException(status_code=422, detail="sender is required.")
+    if tok_in.address == tok_out.address:
+        raise HTTPException(status_code=422, detail="token_in and token_out must be different.")
+
+    try:
+        amount_in_raw = int(Decimal(amount_in_str) * Decimal(10**tok_in.decimals))
+    except (InvalidOperation, ValueError):
+        raise HTTPException(status_code=422, detail=f"Invalid amount_in: {amount_in_str!r}")
+    if amount_in_raw <= 0:
+        raise HTTPException(status_code=422, detail="amount_in must be positive.")
 
     # ── Build graph ──────────────────────────────────────────────────────────
     indexer = get_indexer()
     with Session(indexer._engine) as session:
         pools = session.exec(select(Pool)).all()
-        graph, token_by_symbol = _build_graph(session, list(pools))
-
-    if not token_by_symbol:
-        raise HTTPException(status_code=422, detail="No indexed pools with price data found. Run a backfill first.")
-
-    sym_in = "WETH" if body.is_native_in else body.token_in
-    sym_out = "WETH" if body.is_native_out else body.token_out
-
-    tok_in = token_by_symbol.get(sym_in)
-    tok_out = token_by_symbol.get(sym_out)
-
-    if tok_in is None:
-        raise HTTPException(status_code=422, detail=f"Token '{sym_in}' not found in any indexed pool.")
-    if tok_out is None:
-        raise HTTPException(status_code=422, detail=f"Token '{sym_out}' not found in any indexed pool.")
-    if tok_in.address.lower() == tok_out.address.lower():
-        raise HTTPException(status_code=422, detail="token_in and token_out must be different.")
-
-    try:
-        amount_in_raw = int(Decimal(body.amount_in) * Decimal(10 ** tok_in.decimals))
-    except (InvalidOperation, ValueError):
-        raise HTTPException(status_code=422, detail=f"Invalid amount_in: {body.amount_in!r}")
-    if amount_in_raw <= 0:
-        raise HTTPException(status_code=422, detail="amount_in must be positive.")
+        if not pools:
+            raise HTTPException(status_code=422, detail="No indexed pools found. Run a backfill first.")
+        graph = _build_graph(session, list(pools))
 
     # ── Route (off-chain) ─────────────────────────────────────────────────────
     router_obj = Router(graph)
@@ -315,30 +337,18 @@ async def build_swap(body: BuildBody) -> dict:
     rpc_url = get_rpc_url()
     on_chain_quote_used = False
     on_chain_quote_note: str = ""
-    # amount_out_for_slippage starts as the off-chain indexed estimate;
-    # updated below if we obtain a better on-chain figure.
     amount_out_for_slippage: int = route.amount_out.amount
 
     # ── On-chain quote via QuoterV2 (V3-only routes) ──────────────────────────
-    # quote_swap_transaction issues a single eth_call against the QuoterV2
-    # to get the actual amountOut from current on-chain pool state.
     is_all_v3 = all("v3" in s.protocol.lower() for s in route.steps)
     if rpc_url and is_all_v3:
-        quoter_address = (
-            os.environ.get("V3_QUOTER_ADDRESS", "").strip()
-            or _get_v3_quoter(tok_in.chain_id)
-        )
+        quoter_address = os.environ.get("V3_QUOTER_ADDRESS", "").strip() or _get_v3_quoter(tok_in.chain_id)
         if quoter_address:
             try:
                 from web3 import AsyncWeb3
+
                 w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
-                on_chain = await quote_swap_transaction(
-                    route,
-                    vm_address,
-                    body.sender,
-                    w3,
-                    quoter_address,
-                )
+                on_chain = await quote_swap_transaction(route, vm_address, sender, w3, quoter_address)
                 if on_chain.amount > 0:
                     amount_out_for_slippage = on_chain.amount
                     on_chain_quote_used = True
@@ -351,14 +361,11 @@ async def build_swap(body: BuildBody) -> dict:
     elif not is_all_v3:
         on_chain_quote_note = "route contains non-V3 hops; on-chain quote not supported, using indexed estimate"
 
-    min_final_out = amount_out_for_slippage * (10_000 - body.slippage_bps) // 10_000
-    amount_out_raw = amount_out_for_slippage
-    amount_out_human = str(Decimal(amount_out_raw) / Decimal(10 ** tok_out.decimals))
+    min_final_out = amount_out_for_slippage * (10_000 - slippage_bps) // 10_000
 
     # ── Compile to DeFiVM calldata ────────────────────────────────────────────
     try:
-        if body.is_native_in:
-            # Prepend WETH.deposit() so the ETH wrap and swap execute atomically.
+        if is_native_in:
             weth_address = tok_in.address
             weth = Contract.from_abi(["function deposit() external payable"], to=weth_address)
             deposit_calldata = tx_data_bytes(weth.fns.deposit().data)
@@ -366,12 +373,11 @@ async def build_swap(body: BuildBody) -> dict:
                 dag,
                 amount_in=amount_in_raw,
                 vm_address=vm_address,
-                recipient=body.sender,
+                recipient=sender,
                 min_final_out=min_final_out,
             )
             full_program = (
-                Program().call_contract(weth_address, deposit_calldata, value=amount_in_raw).pop()
-                + swap_prog
+                Program().call_contract(weth_address, deposit_calldata, value=amount_in_raw).pop() + swap_prog
             ).build()
             defi_vm = Contract.from_abi(DEFI_VM_ABI, to=vm_address)
             execute_data = tx_data_bytes(defi_vm.fns.execute(full_program).data)
@@ -379,25 +385,40 @@ async def build_swap(body: BuildBody) -> dict:
             tx_data_bytes_val = bytes(execute_data)
             tx_value = amount_in_raw
         else:
-            tx = build_swap_transaction(dag, amount_in_raw, vm_address, body.sender, min_final_out=min_final_out)
+            tx = build_swap_transaction(dag, amount_in_raw, vm_address, sender, min_final_out=min_final_out)
             tx_to = tx.to
             tx_data_bytes_val = bytes(tx.data)
             tx_value = tx.value
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    quote = AggregatorQuote(
+        token_in=tok_in,
+        token_out=tok_out,
+        amount_in=TokenAmount(tok_in, amount_in_raw),
+        amount_out=TokenAmount(tok_out, amount_out_for_slippage),
+        min_amount_out=TokenAmount(tok_out, min_final_out),
+        gas_estimate=0,
+        tx_data={
+            "to": tx_to,
+            "data": "0x" + tx_data_bytes_val.hex(),
+            "value": str(tx_value),
+        },
+        protocol="pydefi-router",
+        route_summary=f"{tok_in.symbol} → {tok_out.symbol}",
+    )
+
+    amount_out_human = str(Decimal(quote.amount_out.amount) / Decimal(10**tok_out.decimals))
     result: dict = {
-        "to": tx_to,
-        "data": "0x" + tx_data_bytes_val.hex(),
-        "value": str(tx_value),
+        **quote.tx_data,
         "value_eth": str(Decimal(tx_value) / Decimal(10**18)) if tx_value else "0",
-        "token_in": body.token_in,
-        "token_out": body.token_out,
-        "amount_in": body.amount_in,
-        "amount_out": str(amount_out_raw),
+        "token_in": tok_in.symbol,
+        "token_out": tok_out.symbol,
+        "amount_in": amount_in_str,
+        "amount_out": str(quote.amount_out.amount),
         "amount_out_human": amount_out_human,
-        "amount_out_min": str(min_final_out),
-        "slippage_bps": body.slippage_bps,
+        "amount_out_min": str(quote.min_amount_out.amount),
+        "slippage_bps": slippage_bps,
         "on_chain_quote": on_chain_quote_used,
     }
     if on_chain_quote_note:

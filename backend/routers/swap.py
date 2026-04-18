@@ -19,7 +19,7 @@ from pydefi.exceptions import NoRouteFoundError
 from pydefi.indexer import Pool, V2SyncEvent, V3SwapEvent
 from pydefi.pathfinder.graph import PoolEdge, PoolGraph, V3PoolEdge
 from pydefi.pathfinder.router import Router
-from pydefi.types import Token, TokenAmount
+from pydefi.types import RouteDAG, RouteSplit, RouteSplitLeg, RouteSwap, Token, TokenAmount
 from pydefi.utils import DEFI_VM_ABI, tx_data_bytes
 from pydefi.vm import Program, build_execution_program_for_dag
 from pydefi.vm.swap import build_swap_transaction, quote_swap_transaction
@@ -327,8 +327,10 @@ async def get_quote(body: dict) -> dict:
     tok_in = _token_from_body(body.get("token_in") or {})
     tok_out = _token_from_body(body.get("token_out") or {})
     amount_in_str = str(body.get("amount_in", ""))
+    _path_raw = body.get("path")
 
-    if tok_in.address == tok_out.address:
+    # Allow round-trips (same start/end token) only when intermediate hops are provided
+    if tok_in.address == tok_out.address and not (isinstance(_path_raw, list) and len(_path_raw) > 2):
         raise HTTPException(status_code=422, detail="token_in and token_out must be different.")
 
     try:
@@ -344,6 +346,91 @@ async def get_quote(body: dict) -> dict:
         if not pools:
             raise HTTPException(status_code=422, detail="No indexed pools found. Run a backfill first.")
         graph = _build_graph(session, list(pools))
+
+    # ── Custom path: explicit hop-by-hop route ───────────────────────────────
+    if isinstance(_path_raw, list) and len(_path_raw) > 2:
+        path_tokens = [_token_from_body(t) for t in _path_raw]
+        # Optional manual split fractions: list of fraction_bps per leg, must sum to 10000.
+        # e.g. [5000, 5000] for 50/50, [3000, 3000, 4000] for a 3-way split.
+        _split_fracs_raw = body.get("split_fractions_bps")
+        manual_fractions: list[int] | None = None
+        if _split_fracs_raw is not None:
+            try:
+                manual_fractions = [int(x) for x in _split_fracs_raw]
+                if len(manual_fractions) < 2:
+                    raise ValueError("need at least 2 legs")
+                if any(f <= 0 for f in manual_fractions):
+                    raise ValueError("all fractions must be positive")
+                if sum(manual_fractions) != 10000:
+                    raise ValueError(f"fractions must sum to 10000, got {sum(manual_fractions)}")
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=f"split_fractions_bps invalid: {exc}")
+
+        # Use a max_hops=1 router per waypoint pair so each hop is confined to
+        # direct pools only but can still be split across multiple pools when
+        # find_best_split finds it beneficial (e.g. two UNI/USDC V3 pools).
+        hop_router = Router(graph, max_hops=1)
+        combined_actions: list = []
+        cur_amount = amount_in_raw
+        for i in range(len(path_tokens) - 1):
+            t_in_h, t_out_h = path_tokens[i], path_tokens[i + 1]
+
+            # When manual split fractions are requested, pick the top N direct pools
+            # (N = number of requested legs) and build an N-leg RouteSplit.
+            if manual_fractions is not None:
+                n_req = len(manual_fractions)
+                candidates = sorted(
+                    [
+                        e for e in graph.edges_from(t_in_h)
+                        if e.token_out.address.lower() == t_out_h.address.lower()
+                    ],
+                    key=lambda e: e.amount_out(cur_amount // n_req),
+                    reverse=True,
+                )[:n_req]
+                n = len(candidates)
+                if n >= 2:
+                    # Renormalize fractions to the pools actually available
+                    raw_fracs = manual_fractions[:n]
+                    total = sum(raw_fracs)
+                    fracs = [f * 10000 // total for f in raw_fracs[:-1]]
+                    fracs.append(10000 - sum(fracs))
+                    amounts = [cur_amount * f // 10000 for f in fracs[:-1]]
+                    amounts.append(cur_amount - sum(amounts))
+                    combined_actions.append(
+                        RouteSplit(
+                            legs=tuple(
+                                RouteSplitLeg(
+                                    fraction_bps=fracs[j],
+                                    actions=(RouteSwap(token_out=t_out_h, pool=candidates[j]),),
+                                )
+                                for j in range(n)
+                            ),
+                            token_out=t_out_h,
+                        )
+                    )
+                    cur_amount = sum(candidates[j].amount_out(amounts[j]) for j in range(n))
+                    continue
+
+            try:
+                hop_dag = hop_router.find_best_split(TokenAmount(t_in_h, cur_amount), t_out_h)
+            except NoRouteFoundError:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"No indexed pool for {t_in_h.symbol} → {t_out_h.symbol} on chain {t_in_h.chain_id}.",
+                )
+            cur_amount = hop_router.simulate(hop_dag, cur_amount)
+            combined_actions.extend(hop_dag.actions)
+        dag_path = RouteDAG().from_token(path_tokens[0])
+        dag_path.actions.extend(combined_actions)
+        amount_out_human = str(Decimal(cur_amount) / Decimal(10 ** path_tokens[-1].decimals))
+        return {
+            "amount_out": str(cur_amount),
+            "amount_out_human": amount_out_human,
+            "price_impact": "NaN",
+            "token_in": path_tokens[0].symbol,
+            "token_out": path_tokens[-1].symbol,
+            "dag": _serialize_dag(dag_path),
+        }
 
     router_obj = Router(graph)
     try:

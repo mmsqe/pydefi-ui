@@ -162,12 +162,12 @@ function buildSections(actions: DAGAction[], tokenIn: string): VisualSection[] {
 
 function DAGDiagram({
   dag,
-  selectedLaneIdx = null,
+  selectedLane = null,
   onLaneClick = () => {},
 }: {
   dag: RouteDAGData;
-  selectedLaneIdx?: number | null;
-  onLaneClick?: (legIdx: number) => void;
+  selectedLane?: { si: number; li: number } | null;
+  onLaneClick?: (si: number, li: number, sectionFracs: number[]) => void;
 }) {
   const sections = buildSections(dag.actions, dag.token_in);
   if (sections.length === 0) {
@@ -227,8 +227,14 @@ function DAGDiagram({
         if (sec.type === "seq") {
           // Sequential hops drawn on the center line
           const n = sec.hops.length;
+          const isSeqSelected = selectedLane?.si === si && selectedLane?.li === 0;
           return (
             <g key={si}>
+              {isSeqSelected && (
+                <rect x={x1} y={cy - D_LANE_H / 2} width={x2 - x1} height={D_LANE_H}
+                  fill="#00d4ff05" stroke="#00d4ff" strokeWidth="1" strokeOpacity="0.35" rx="4"
+                  style={{ pointerEvents: "none" }} />
+              )}
               {sec.hops.map((hop, j) => {
                 const hx1 = x1 + (j / n) * (x2 - x1);
                 const hx2 = x1 + ((j + 1) / n) * (x2 - x1);
@@ -247,6 +253,10 @@ function DAGDiagram({
                   </g>
                 );
               })}
+              {/* Clickable overlay — lets user select this hop to split it */}
+              <rect x={x1} y={cy - D_LANE_H / 2} width={x2 - x1} height={D_LANE_H}
+                fill="transparent" style={{ cursor: "pointer" }}
+                onClick={() => onLaneClick(si, 0, [100])} />
             </g>
           );
         }
@@ -262,7 +272,7 @@ function DAGDiagram({
               const y = laneY(li, nLegs);
               const nHops = Math.max(leg.hops.length, 1);
               const segW = (lx2 - lx1) / nHops;
-              const isSelected = nLegs > 1 && li === selectedLaneIdx;
+              const isSelected = nLegs > 1 && si === selectedLane?.si && li === selectedLane?.li;
               const fc = isSelected ? "#00d4ff" : (nLegs > 1 ? "#3b4560" : (leg.hops[0] ? protocolColor(leg.hops[0].protocol) : "#3b4560"));
               const laneTop = y - D_LANE_H / 2 + 6;
               const laneH = D_LANE_H - 12;
@@ -320,7 +330,7 @@ function DAGDiagram({
                   {nLegs > 1 && (
                     <rect x={x1} y={y - D_LANE_H / 2} width={x2 - x1} height={D_LANE_H}
                       fill="transparent" style={{ cursor: "pointer" }}
-                      onClick={() => onLaneClick(li)} />
+                      onClick={() => onLaneClick(si, li, sec.legs.map((l) => Math.round(l.fraction_bps / 100)))} />
                   )}
                 </g>
               );
@@ -509,8 +519,10 @@ export default function RoutingLabPage() {
   const [amountIn, setAmountIn] = useState("1");
   // splitFractions: null = auto; array of percentages summing to 100 = manual N-way split
   const [splitFractions, setSplitFractions] = useState<number[] | null>(null);
-  // selectedLegIdx: which split lane is currently highlighted (null = none)
-  const [selectedLegIdx, setSelectedLegIdx] = useState<number | null>(null);
+  // selectedLane: which split lane is highlighted — tracks both section and leg index
+  const [selectedLane, setSelectedLane] = useState<{ si: number; li: number } | null>(null);
+  // fracs of the clicked section (may differ from the global autoFracs)
+  const [selectedSectionFracs, setSelectedSectionFracs] = useState<number[] | null>(null);
   const [quote, setQuote] = useState<QuoteResult | null>(null);
   const [quoting, setQuoting] = useState(false);
   const [quoteError, setQuoteError] = useState<string | null>(null);
@@ -668,7 +680,8 @@ export default function RoutingLabPage() {
   useEffect(() => {
     if (isRestoringFromUrl.current) { isRestoringFromUrl.current = false; return; }
     setSplitFractions(null);
-    setSelectedLegIdx(null);
+    setSelectedLane(null);
+    setSelectedSectionFracs(null);
   }, [waypoints]);
 
   useEffect(() => {
@@ -694,11 +707,15 @@ export default function RoutingLabPage() {
     [quoteLanes],
   );
 
-  // Clicking a lane in the diagram: highlight it and switch to manual mode
-  const handleLaneClick = useCallback((legIdx: number) => {
-    setSelectedLegIdx((prev) => prev === legIdx ? null : legIdx);
-    setSplitFractions((prev) => prev ?? autoFracs);
-  }, [autoFracs]);
+  // Clicking a lane in the diagram: visually select it (no quote re-trigger)
+  const handleLaneClick = useCallback((si: number, li: number, sectionFracs: number[]) => {
+    setSelectedLane((prev) => {
+      if (prev?.si === si && prev?.li === li) { setSelectedSectionFracs(null); return null; }
+      // seq sections pass [] — keep showing the global fracs in the controls
+      setSelectedSectionFracs(sectionFracs.length > 0 ? sectionFracs : null);
+      return { si, li };
+    });
+  }, []);
 
   // ── Render ──────────────────────────────────────────────────────────────────
 
@@ -920,8 +937,8 @@ export default function RoutingLabPage() {
               <p className="text-[10px] text-muted uppercase tracking-wider">Route</p>
               <div className="flex items-center gap-3 flex-wrap">
                 {waypoints.length > 2 && (() => {
-                  const fracs: number[] = splitFractions ?? autoFracs ?? [];
-                  if (fracs.length < 2) return null;
+                  const fracs: number[] = splitFractions ?? selectedSectionFracs ?? autoFracs ?? [];
+                  if (fracs.length < 1) return null;
 
                   const adjust = (i: number, delta: number) => {
                     const next = [...fracs];
@@ -933,19 +950,19 @@ export default function RoutingLabPage() {
                     setSplitFractions(next);
                   };
 
+                  const selLi = selectedLane?.li ?? null;
+
                   const addLeg = () => {
-                    // Split the selected lane (or the largest if none selected)
-                    const targetIdx = (selectedLegIdx !== null && selectedLegIdx < fracs.length)
-                      ? selectedLegIdx
+                    const targetIdx = (selLi !== null && selLi < fracs.length)
+                      ? selLi
                       : fracs.indexOf(Math.max(...fracs));
                     const give = Math.floor(fracs[targetIdx] / 2 / 5) * 5;
                     if (give < 5) return;
                     const next = [...fracs];
                     next[targetIdx] -= give;
-                    // Insert the new lane right after the split target
                     next.splice(targetIdx + 1, 0, give);
                     setSplitFractions(next);
-                    setSelectedLegIdx(targetIdx + 1);
+                    setSelectedLane((prev) => ({ si: prev?.si ?? -1, li: targetIdx + 1 }));
                   };
 
                   const removeLeg = (i: number) => {
@@ -954,10 +971,9 @@ export default function RoutingLabPage() {
                     const next = fracs.filter((_, j) => j !== i);
                     next[next.length - 1] += removed;
                     setSplitFractions(next);
-                    setSelectedLegIdx((prev) => {
-                      if (prev === null) return null;
-                      if (prev === i) return null;
-                      return prev > i ? prev - 1 : prev;
+                    setSelectedLane((prev) => {
+                      if (prev === null || prev.li === i) return null;
+                      return prev.li > i ? { ...prev, li: prev.li - 1 } : prev;
                     });
                   };
 
@@ -965,22 +981,27 @@ export default function RoutingLabPage() {
                     <div className="flex items-center gap-1.5 flex-wrap">
                       <span className="text-[10px] text-muted">Split</span>
                       {fracs.map((pct, i) => {
-                        const isSel = i === selectedLegIdx;
+                        const isSel = i === selLi;
+                        const isReadOnly = fracs.length === 1;
                         return (
                           <div key={i}
-                            onClick={() => setSelectedLegIdx((prev) => prev === i ? null : i)}
-                            className={`flex items-center gap-0.5 border rounded px-1 py-0.5 cursor-pointer transition-colors ${
-                              isSel
-                                ? "border-cyan bg-cyan/15 ring-1 ring-cyan/40"
-                                : "border-cyan/30 bg-cyan/5 hover:border-cyan/60"
+                            onClick={() => !isReadOnly && setSelectedLane((prev) => (prev?.li === i) ? null : { si: prev?.si ?? -1, li: i })}
+                            className={`flex items-center gap-0.5 border rounded px-1 py-0.5 transition-colors ${
+                              isReadOnly
+                                ? "border-cyan/20 bg-cyan/5 cursor-default"
+                                : isSel
+                                  ? "border-cyan bg-cyan/15 ring-1 ring-cyan/40 cursor-pointer"
+                                  : "border-cyan/30 bg-cyan/5 hover:border-cyan/60 cursor-pointer"
                             }`}>
-                            <div className="flex flex-col" style={{ lineHeight: 1 }}>
-                              <button onClick={(e) => { e.stopPropagation(); adjust(i, 5); }}
-                                className="text-[7px] text-muted hover:text-cyan px-0.5">▲</button>
-                              <button onClick={(e) => { e.stopPropagation(); adjust(i, -5); }}
-                                className="text-[7px] text-muted hover:text-cyan px-0.5">▼</button>
-                            </div>
-                            <span className={`text-[10px] font-mono w-7 text-center ${isSel ? "text-cyan font-bold" : "text-cyan"}`}>{pct}%</span>
+                            {!isReadOnly && (
+                              <div className="flex flex-col" style={{ lineHeight: 1 }}>
+                                <button onClick={(e) => { e.stopPropagation(); adjust(i, 5); }}
+                                  className="text-[7px] text-muted hover:text-cyan px-0.5">▲</button>
+                                <button onClick={(e) => { e.stopPropagation(); adjust(i, -5); }}
+                                  className="text-[7px] text-muted hover:text-cyan px-0.5">▼</button>
+                              </div>
+                            )}
+                            <span className={`text-[10px] font-mono w-7 text-center ${isSel && !isReadOnly ? "text-cyan font-bold" : "text-cyan/60"}`}>{pct}%</span>
                             {fracs.length > 2 && (
                               <button onClick={(e) => { e.stopPropagation(); removeLeg(i); }}
                                 className="text-[8px] text-muted hover:text-red-400 ml-0.5">×</button>
@@ -988,13 +1009,19 @@ export default function RoutingLabPage() {
                           </div>
                         );
                       })}
-                      <button onClick={addLeg}
-                        title={selectedLegIdx !== null ? `Split lane ${selectedLegIdx + 1}` : "Split largest lane"}
-                        className="text-[10px] text-muted hover:text-cyan border border-dashed border-border-dim rounded px-1.5 py-0.5">
-                        +
-                      </button>
+                      {fracs.length > 1 && (
+                        <button onClick={addLeg}
+                          title={
+                            selectedLane && selectedSectionFracs === null
+                              ? "Add a parallel pool across all hops (splits apply globally)"
+                              : selLi !== null ? `Split lane ${selLi + 1}` : "Split largest lane"
+                          }
+                          className="text-[10px] text-muted hover:text-cyan border border-dashed border-border-dim rounded px-1.5 py-0.5">
+                          +
+                        </button>
+                      )}
                       {splitFractions !== null && (
-                        <button onClick={() => { setSplitFractions(null); setSelectedLegIdx(null); }}
+                        <button onClick={() => { setSplitFractions(null); setSelectedLane(null); setSelectedSectionFracs(null); }}
                           className="text-[10px] text-muted hover:text-[#e8eaf0] transition-colors">
                           auto
                         </button>
@@ -1010,7 +1037,7 @@ export default function RoutingLabPage() {
               </div>
             </div>
             <div className="bg-[#0a0b0e] rounded-xl px-2 py-3">
-              <DAGDiagram dag={quote.dag} selectedLaneIdx={selectedLegIdx} onLaneClick={handleLaneClick} />
+              <DAGDiagram dag={quote.dag} selectedLane={selectedLane} onLaneClick={handleLaneClick} />
             </div>
           </CardContent>
         </Card>

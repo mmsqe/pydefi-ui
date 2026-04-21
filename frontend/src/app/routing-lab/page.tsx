@@ -49,6 +49,22 @@ interface QuoteResult {
   token_in: string; token_out: string; dag: RouteDAGData;
 }
 
+/** Returns true if picking `token` at position `changeIdx` (−1 = append) would
+ *  produce an invalid route.  Two cases are rejected by the backend:
+ *  1. start === end with no intermediate hops (only 2 waypoints total)
+ *  2. any consecutive pair is the same token (e.g. WETH→WETH) — the router
+ *     raises ValueError for same-token hops regardless of path length. */
+function wouldConflict(waypoints: string[], changeIdx: number, token: string): boolean {
+  const next = changeIdx === -1
+    ? [...waypoints, token]
+    : waypoints.map((w, j) => (j === changeIdx ? token : w));
+  if (next.length <= 2 && next[0] === next.at(-1)) return true;
+  for (let i = 0; i < next.length - 1; i++) {
+    if (next[i] === next[i + 1]) return true;
+  }
+  return false;
+}
+
 function dagPoolAddresses(actions: DAGAction[]): string[] {
   const out: string[] = [];
   for (const a of actions) {
@@ -740,7 +756,7 @@ export default function RoutingLabPage() {
                           }}
                           className="text-xs bg-transparent text-[#e8eaf0] focus:outline-none"
                         >
-                          {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
+                          {symbols.map((s) => <option key={s} value={s} disabled={wouldConflict(waypoints, i, s)}>{s}</option>)}
                         </select>
                         <button
                           onClick={() => { setWaypoints(waypoints.filter((_, j) => j !== i)); setQuote(null); setQuoteError(null); }}
@@ -762,7 +778,7 @@ export default function RoutingLabPage() {
                       className="text-xs bg-[#0d1117] border border-border-dim rounded-md px-1.5 py-0.5 text-muted focus:outline-none focus:border-cyan/40"
                     >
                       <option value="">+ hop</option>
-                      {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
+                      {symbols.map((s) => <option key={s} value={s} disabled={wouldConflict(waypoints, -1, s)}>{s}</option>)}
                     </select>
                   </div>
                 </>

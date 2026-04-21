@@ -412,10 +412,10 @@ async def get_quote(body: dict) -> dict:
 
             try:
                 hop_dag = hop_router.find_best_split(TokenAmount(t_in_h, cur_amount), t_out_h)
-            except NoRouteFoundError:
+            except (NoRouteFoundError, ValueError) as exc:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"No indexed pool for {t_in_h.symbol} → {t_out_h.symbol} on chain {t_in_h.chain_id}.",
+                    detail=str(exc) if isinstance(exc, ValueError) else f"No indexed pool for {t_in_h.symbol} → {t_out_h.symbol} on chain {t_in_h.chain_id}.",
                 )
             cur_amount = hop_router.simulate(hop_dag, cur_amount)
             combined_actions.extend(hop_dag.actions)

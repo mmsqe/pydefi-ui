@@ -12,6 +12,7 @@ from decimal import Decimal, InvalidOperation
 
 from eth_contract import Contract
 from fastapi import APIRouter, HTTPException
+from pydefi.abi import DeFiVM
 from pydefi.abi.amm import UNISWAP_V2_FACTORY, UNISWAP_V2_PAIR, UNISWAP_V3_FACTORY, UNISWAP_V3_POOL
 from pydefi.aggregator.base import AggregatorQuote
 from pydefi.deployments import get_address
@@ -19,10 +20,9 @@ from pydefi.exceptions import NoRouteFoundError
 from pydefi.indexer import Pool, V2SyncEvent, V3SwapEvent
 from pydefi.pathfinder.graph import PoolEdge, PoolGraph, V3PoolEdge
 from pydefi.pathfinder.router import Router
-from pydefi.types import RouteDAG, RouteSplit, RouteSplitLeg, RouteSwap, Token, TokenAmount
-from pydefi.utils import DEFI_VM_ABI, tx_data_bytes
-from pydefi.vm import Program, build_execution_program_for_dag
-from pydefi.vm.swap import build_swap_transaction, quote_swap_transaction
+from pydefi.types import ZERO_ADDRESS, Address, RouteDAG, RouteSplit, RouteSplitLeg, RouteSwap, Token, TokenAmount
+from pydefi.vm import Program, build_execution_program_for_dag, build_quote_program_for_dag
+from pydefi.vm.swap import build_swap_transaction
 from sqlmodel import Session, select
 
 from backend.deps import get_indexer, get_rpc_url
@@ -62,7 +62,7 @@ def _token_from_body(data: dict) -> Token:
     try:
         return Token(
             chain_id=int(data["chain_id"]),
-            address=str(data["address"]).lower(),
+            address=Address(data["address"]),
             symbol=str(data["symbol"]),
             decimals=int(data["decimals"]),
         )
@@ -75,19 +75,20 @@ def _build_graph(session: Session, pools: list[Pool]) -> PoolGraph:
     graph = PoolGraph()
 
     for pool in pools:
-        addr = pool.pool_address.lower()
+        pool_addr = Address(pool.pool_address)
+        addr = pool_addr.to_0x_hex().lower()  # lowercase string for DB queries
         protocol = (pool.protocol or "unknown").lower()
         fee_bps = pool.fee_bps or 30
 
         t0 = Token(
             chain_id=pool.chain_id,
-            address=pool.token0_address,
+            address=Address(pool.token0_address),
             symbol=pool.token0_symbol,
             decimals=pool.token0_decimals,
         )
         t1 = Token(
             chain_id=pool.chain_id,
-            address=pool.token1_address,
+            address=Address(pool.token1_address),
             symbol=pool.token1_symbol,
             decimals=pool.token1_decimals,
         )
@@ -105,7 +106,7 @@ def _build_graph(session: Session, pools: list[Pool]) -> PoolGraph:
                 PoolEdge(
                     token_in=t0,
                     token_out=t1,
-                    pool_address=addr,
+                    pool_address=pool_addr,
                     protocol=protocol,
                     reserve_in=ev.reserve0,
                     reserve_out=ev.reserve1,
@@ -117,7 +118,7 @@ def _build_graph(session: Session, pools: list[Pool]) -> PoolGraph:
                 PoolEdge(
                     token_in=t1,
                     token_out=t0,
-                    pool_address=addr,
+                    pool_address=pool_addr,
                     protocol=protocol,
                     reserve_in=ev.reserve1,
                     reserve_out=ev.reserve0,
@@ -140,7 +141,7 @@ def _build_graph(session: Session, pools: list[Pool]) -> PoolGraph:
                 V3PoolEdge(
                     token_in=t0,
                     token_out=t1,
-                    pool_address=addr,
+                    pool_address=pool_addr,
                     protocol=protocol,
                     fee_bps=fee_bps,
                     sqrt_price_x96=ev3.sqrt_price_x96,
@@ -152,7 +153,7 @@ def _build_graph(session: Session, pools: list[Pool]) -> PoolGraph:
                 V3PoolEdge(
                     token_in=t1,
                     token_out=t0,
-                    pool_address=addr,
+                    pool_address=pool_addr,
                     protocol=protocol,
                     fee_bps=fee_bps,
                     sqrt_price_x96=ev3.sqrt_price_x96,
@@ -181,7 +182,7 @@ def _serialize_dag(dag) -> dict:
                     {
                         "type": "swap",
                         "token_out": action.token_out.symbol,
-                        "pool_address": action.pool.pool_address,
+                        "pool_address": action.pool.pool_address.to_0x_hex(),
                         "protocol": action.pool.protocol,
                         "fee_bps": action.pool.fee_bps,
                     }
@@ -205,8 +206,6 @@ def _serialize_dag(dag) -> dict:
 # ---------------------------------------------------------------------------
 # On-demand pool discovery (used as fallback when no route is found)
 # ---------------------------------------------------------------------------
-
-_ZERO_ADDR = "0x" + "0" * 40
 
 
 async def _augment_graph_on_demand(
@@ -245,7 +244,8 @@ async def _augment_graph_on_demand(
                 pool_addr = await factory.fns.getPool(addr_a, addr_b, fee_tier).call(w3)
             except Exception:
                 continue
-            if not pool_addr or pool_addr.lower() == _ZERO_ADDR:
+            edge_addr = Address(pool_addr) if pool_addr else None
+            if not edge_addr or edge_addr == ZERO_ADDRESS:
                 continue
             pool_contract = UNISWAP_V3_POOL(to=pool_addr)
             try:
@@ -263,12 +263,12 @@ async def _augment_graph_on_demand(
                     V3PoolEdge(
                         token_in=t_in,
                         token_out=t_out,
-                        pool_address=pool_addr.lower(),
+                        pool_address=edge_addr,
                         protocol="UniswapV3",
                         fee_bps=fee_bps,
                         sqrt_price_x96=sqrt_price_x96,
                         liquidity=liquidity,
-                        is_token0_in=(token0_addr.lower() == t_in.address.lower()),
+                        is_token0_in=(Address(token0_addr) == t_in.address),
                     )
                 )
 
@@ -278,8 +278,8 @@ async def _augment_graph_on_demand(
         try:
             pair_addr = await factory_v2.fns.getPair(addr_a, addr_b).call(w3)
         except Exception:
-            pair_addr = _ZERO_ADDR
-        if pair_addr and pair_addr.lower() != _ZERO_ADDR:
+            pair_addr = None
+        if pair_addr and Address(pair_addr) != ZERO_ADDRESS:
             pair = UNISWAP_V2_PAIR(to=pair_addr)
             try:
                 token0_v2 = await pair.fns.token0().call(w3)
@@ -288,8 +288,10 @@ async def _augment_graph_on_demand(
             except Exception:
                 r0 = r1 = 0
             if r0 > 0 and r1 > 0:
-                tok0 = tok_in if token0_v2.lower() == addr_a.lower() else tok_out
-                tok1 = tok_out if token0_v2.lower() == addr_a.lower() else tok_in
+                token0_v2_addr = Address(token0_v2)
+                tok0 = tok_in if token0_v2_addr == addr_a else tok_out
+                tok1 = tok_out if token0_v2_addr == addr_a else tok_in
+                pair_edge_addr = Address(pair_addr)
                 for t_in, t_out, r_in, r_out in (
                     (tok0, tok1, r0, r1),
                     (tok1, tok0, r1, r0),
@@ -298,12 +300,12 @@ async def _augment_graph_on_demand(
                         PoolEdge(
                             token_in=t_in,
                             token_out=t_out,
-                            pool_address=pair_addr.lower(),
+                            pool_address=pair_edge_addr,
                             protocol="UniswapV2",
                             fee_bps=30,
                             reserve_in=r_in,
                             reserve_out=r_out,
-                            extra={"is_token0_in": t_in.address.lower() == token0_v2.lower()},
+                            extra={"is_token0_in": t_in.address == token0_v2_addr},
                         )
                     )
 
@@ -380,10 +382,7 @@ async def get_quote(body: dict) -> dict:
             if manual_fractions is not None:
                 n_req = len(manual_fractions)
                 candidates = sorted(
-                    [
-                        e for e in graph.edges_from(t_in_h)
-                        if e.token_out.address.lower() == t_out_h.address.lower()
-                    ],
+                    [e for e in graph.edges_from(t_in_h) if e.token_out.address == t_out_h.address],
                     key=lambda e: e.amount_out(cur_amount // n_req),
                     reverse=True,
                 )[:n_req]
@@ -559,7 +558,7 @@ async def build_swap(body: dict) -> dict:
     amount_out_for_slippage: int = route.amount_out.amount
 
     # ── On-chain quote via DeFiVM eth_call (V2 + V3 routes) ─────────────────────
-    # quote_swap_transaction composes a DeFiVM program that:
+    # build_quote_program_for_dag composes a view-only DeFiVM program that:
     #   V2 hops — pair.getReserves() + constant-product formula (live reserves)
     #   V3 hops — quoter.quoteExactInput per hop
     if rpc_url:
@@ -569,9 +568,11 @@ async def build_swap(body: dict) -> dict:
                 from web3 import AsyncWeb3
 
                 w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
-                on_chain = await quote_swap_transaction(route, vm_address, sender, w3, quoter_address)
-                if on_chain.amount > 0:
-                    amount_out_for_slippage = on_chain.amount
+                quote_prog = build_quote_program_for_dag(dag, amount_in=amount_in_raw, quoter_address=quoter_address)
+                returndata = await w3.eth.call({"to": vm_address, "data": bytes(quote_prog)})
+                amount_out = int.from_bytes(returndata[:32], "big")
+                if amount_out > 0:
+                    amount_out_for_slippage = amount_out
                     on_chain_quote_used = True
             except Exception as exc:
                 on_chain_quote_note = f"on-chain quote failed ({exc}); using indexed estimate"
@@ -587,7 +588,7 @@ async def build_swap(body: dict) -> dict:
         if is_native_in:
             weth_address = tok_in.address
             weth = Contract.from_abi(["function deposit() external payable"], to=weth_address)
-            deposit_calldata = tx_data_bytes(weth.fns.deposit().data)
+            deposit_calldata = weth.fns.deposit().data
             swap_prog = build_execution_program_for_dag(
                 dag,
                 amount_in=amount_in_raw,
@@ -598,10 +599,9 @@ async def build_swap(body: dict) -> dict:
             full_program = (
                 Program().call_contract(weth_address, deposit_calldata, value=amount_in_raw).pop() + swap_prog
             ).build()
-            defi_vm = Contract.from_abi(DEFI_VM_ABI, to=vm_address)
-            execute_data = tx_data_bytes(defi_vm.fns.execute(full_program).data)
+            defi_vm = DeFiVM(to=vm_address)
             tx_to = vm_address
-            tx_data_bytes_val = bytes(execute_data)
+            tx_data_bytes_val = bytes(defi_vm.fns.execute(full_program).data)
             tx_value = amount_in_raw
         else:
             tx = build_swap_transaction(dag, amount_in_raw, vm_address, sender, min_final_out=min_final_out)

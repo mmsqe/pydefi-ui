@@ -500,6 +500,8 @@ export default function RoutingLabPage() {
   const dragStart = useRef({ px: 0, py: 0, nx: 0, ny: 0 });
   const didDrag = useRef(false);
   const svgRef = useRef<SVGSVGElement>(null) as React.RefObject<SVGSVGElement>;
+  // Prevents the waypoints-change effect from clearing restored split fractions
+  const isRestoringFromUrl = useRef(false);
 
   const [waypoints, setWaypoints] = useState<string[]>([]);
   const selectedIn = waypoints[0] ?? "";
@@ -632,8 +634,42 @@ export default function RoutingLabPage() {
     }
   }, [waypoints, amountIn, splitFractions, tokenNodes]);
 
-  // Reset manual split and selection when the path changes
-  useEffect(() => { setSplitFractions(null); setSelectedLegIdx(null); }, [waypoints]);
+  // ── URL state sync ───────────────────────────────────────────────────────────
+
+  // Restore state from URL on mount (runs once)
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search);
+    const t = p.get("t");
+    const a = p.get("a");
+    const s = p.get("s");
+    const tokens = t ? t.split(",").filter(Boolean) : [];
+    if (tokens.length < 2 && !a) return;
+    isRestoringFromUrl.current = true;
+    if (tokens.length >= 2) setWaypoints(tokens);
+    if (a) setAmountIn(a);
+    if (s) {
+      const parts = s.split(",").map(Number);
+      if (parts.length >= 2 && parts.every((n) => !isNaN(n) && n > 0)) setSplitFractions(parts);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Write state to URL whenever it changes (replaceState — no history entry)
+  useEffect(() => {
+    const p = new URLSearchParams();
+    if (waypoints.length > 0) p.set("t", waypoints.join(","));
+    if (amountIn && amountIn !== "1") p.set("a", amountIn);
+    if (splitFractions) p.set("s", splitFractions.join(","));
+    const qs = p.toString();
+    history.replaceState(null, "", qs ? `?${qs}` : window.location.pathname);
+  }, [waypoints, amountIn, splitFractions]);
+
+  // Reset manual split and selection when the path changes (skip during URL restore)
+  useEffect(() => {
+    if (isRestoringFromUrl.current) { isRestoringFromUrl.current = false; return; }
+    setSplitFractions(null);
+    setSelectedLegIdx(null);
+  }, [waypoints]);
 
   useEffect(() => {
     if (waypoints.length < 2) return;

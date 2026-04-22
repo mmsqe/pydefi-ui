@@ -1,32 +1,15 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
+import { useUrlRestoreOnce, useUrlWrite } from "@/lib/use-url-state";
 import { Card, CardContent } from "@/components/ui/card";
 import { Loader, RefreshCw, ArrowRight, X } from "lucide-react";
 import { fetchPools } from "@/lib/api";
 import type { Pool } from "@/lib/types";
-
-// ── Token colours ─────────────────────────────────────────────────────────────
-function tokenColor(sym: string): string {
-  let hash = 0;
-  for (let i = 0; i < sym.length; i++) hash = (hash * 31 + sym.charCodeAt(i)) >>> 0;
-  return `hsl(${hash % 360}, 70%, 65%)`;
-}
-
-const PROTOCOL_COLOR: Record<string, string> = {
-  v3: "#00d4ff", uniswapv3: "#00d4ff",
-  v2: "#8b5cf6", uniswapv2: "#8b5cf6", sushiswap: "#8b5cf6",
-};
-function protocolColor(p: string) {
-  return PROTOCOL_COLOR[p.toLowerCase()] ?? "#64748b";
-}
-function protocolShort(p: string): string {
-  const l = p.toLowerCase();
-  if (l === "uniswapv3" || l === "v3") return "V3";
-  if (l === "uniswapv2" || l === "v2") return "V2";
-  if (l === "sushiswap") return "SushiV2";
-  return p;
-}
+import {
+  RouteTree, flattenDAG, tokenColor, protocolColor,
+  type DAGAction, type RouteDAGData,
+} from "@/components/ui/route-tree";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -36,14 +19,6 @@ interface TokenNode {
 interface GraphEdge {
   pool_address: string; from: string; to: string; protocol: string; fee_bps: number;
 }
-interface DAGSwap {
-  type: "swap"; token_out: string; pool_address: string; protocol: string; fee_bps: number;
-}
-interface DAGSplit {
-  type: "split"; token_out: string; legs: { fraction_bps: number; actions: DAGAction[] }[];
-}
-type DAGAction = DAGSwap | DAGSplit;
-interface RouteDAGData { token_in: string; actions: DAGAction[]; }
 interface QuoteResult {
   amount_out: string; amount_out_human: string; price_impact: string;
   token_in: string; token_out: string; dag: RouteDAGData;
@@ -72,290 +47,6 @@ function dagPoolAddresses(actions: DAGAction[]): string[] {
     else a.legs.forEach((l) => out.push(...dagPoolAddresses(l.actions)));
   }
   return out;
-}
-
-// ── DAG diagram ───────────────────────────────────────────────────
-
-interface VisualHop { token_in: string; token_out: string; protocol: string; fee_bps: number; }
-interface VisualLane { fraction_bps: number; hops: VisualHop[]; }
-
-function flattenDAG(actions: DAGAction[], tokenIn: string, fraction = 10000): VisualLane[] {
-  let cur = tokenIn;
-  const pre: VisualHop[] = [];
-  for (let i = 0; i < actions.length; i++) {
-    const a = actions[i];
-    if (a.type === "swap") {
-      pre.push({ token_in: cur, token_out: a.token_out, protocol: a.protocol, fee_bps: a.fee_bps });
-      cur = a.token_out;
-    } else {
-      const remaining = actions.slice(i + 1);
-      const lanes: VisualLane[] = [];
-      for (const leg of a.legs) {
-        const legFrac = Math.round((fraction * leg.fraction_bps) / 10000);
-        for (const sub of flattenDAG(leg.actions, cur, legFrac)) {
-          const postHops = remaining.length > 0
-            ? (flattenDAG(remaining, a.token_out, sub.fraction_bps)[0]?.hops ?? [])
-            : [];
-          lanes.push({ fraction_bps: sub.fraction_bps, hops: [...pre, ...sub.hops, ...postHops] });
-        }
-      }
-      return lanes;
-    }
-  }
-  return [{ fraction_bps: fraction, hops: pre }];
-}
-
-const D_W = 680;
-const D_NODE_R = 22;
-const D_INT_R = 16;
-const D_LANE_H = 64;
-const D_PAD_Y = 18;
-const D_PAD_X = 58;
-
-// ── Section-based DAG types ───────────────────────────────────────────────────
-
-interface VisualSeqSection { type: "seq"; hops: VisualHop[]; }
-interface VisualSplitSection {
-  type: "split";
-  token_in: string;
-  legs: { fraction_bps: number; hops: VisualHop[] }[];
-  token_out: string;
-}
-type VisualSection = VisualSeqSection | VisualSplitSection;
-
-/** Convert DAGActions into visual sections — one section per action.
- *
- *  Each RouteSwap becomes its own single-hop "seq" section so that
- *  intermediate token circles appear as proper graph nodes between sections
- *  (e.g. WETH→UNI→USDC→WETH shows UNI and USDC circles, not just badges).
- *  Each RouteSplit becomes one "split" section.  Nested splits within legs
- *  are flattened one level. */
-function buildSections(actions: DAGAction[], tokenIn: string): VisualSection[] {
-  const sections: VisualSection[] = [];
-  let cur = tokenIn;
-  for (const a of actions) {
-    if (a.type === "swap") {
-      sections.push({ type: "seq", hops: [{ token_in: cur, token_out: a.token_out, protocol: a.protocol, fee_bps: a.fee_bps }] });
-      cur = a.token_out;
-    } else {
-      sections.push({
-        type: "split", token_in: cur,
-        legs: a.legs.map((leg) => {
-          let lc = cur; const hops: VisualHop[] = [];
-          for (const la of leg.actions) {
-            if (la.type === "swap") {
-              hops.push({ token_in: lc, token_out: la.token_out, protocol: la.protocol, fee_bps: la.fee_bps });
-              lc = la.token_out;
-            }
-          }
-          return { fraction_bps: leg.fraction_bps, hops };
-        }),
-        token_out: a.token_out,
-      });
-      cur = a.token_out;
-    }
-  }
-  return sections;
-}
-
-// ── DAG diagram ───────────────────────────────────────────────────────────────
-
-function DAGDiagram({
-  dag,
-  selectedLane = null,
-  onLaneClick = () => {},
-}: {
-  dag: RouteDAGData;
-  selectedLane?: { si: number; li: number } | null;
-  onLaneClick?: (si: number, li: number, sectionFracs: number[]) => void;
-}) {
-  const sections = buildSections(dag.actions, dag.token_in);
-  if (sections.length === 0) {
-    return <p className="text-xs text-muted py-4 text-center">No swaps in route.</p>;
-  }
-
-  // Vertical: height driven by the widest split block
-  const maxLanes = sections.reduce((m, s) => s.type === "split" ? Math.max(m, s.legs.length) : m, 1);
-  const H = D_PAD_Y * 2 + Math.max(maxLanes, 1) * D_LANE_H;
-  const cy = H / 2;
-
-  // Node list: [tokenIn, inter0, inter1, …, tokenOut]
-  const nodeSyms: string[] = [dag.token_in];
-  for (let i = 0; i < sections.length - 1; i++) {
-    const s = sections[i];
-    nodeSyms.push(s.type === "seq" ? s.hops.at(-1)!.token_out : s.token_out);
-  }
-  const last = sections.at(-1)!;
-  nodeSyms.push(last.type === "seq" ? last.hops.at(-1)!.token_out : last.token_out);
-
-  const nodeR = (i: number) => (i === 0 || i === nodeSyms.length - 1) ? D_NODE_R : D_INT_R;
-
-  // Section weights: hop count + 0.5 bonus for split fan lines
-  const weights = sections.map((s) =>
-    s.type === "seq" ? s.hops.length : Math.max(...s.legs.map((l) => l.hops.length), 1) + 0.5,
-  );
-  const totalW = weights.reduce((a, b) => a + b, 0) || 1;
-  const totalNodePx = nodeSyms.reduce((sum, _, i) => sum + 2 * nodeR(i), 0);
-  const availPx = D_W - 2 * D_PAD_X - totalNodePx;
-
-  // Left-to-right layout: alternate node → section → node → …
-  let xCur = D_PAD_X;
-  const nodeCx: number[] = [];
-  const bounds: { x1: number; x2: number }[] = [];
-  for (let i = 0; i < nodeSyms.length; i++) {
-    nodeCx.push(xCur + nodeR(i));
-    xCur += 2 * nodeR(i);
-    if (i < sections.length) {
-      const sw = (weights[i] / totalW) * availPx;
-      bounds.push({ x1: xCur, x2: xCur + sw });
-      xCur += sw;
-    }
-  }
-
-  const laneY = (li: number, nLegs: number) =>
-    cy - (nLegs * D_LANE_H) / 2 + D_LANE_H / 2 + li * D_LANE_H;
-
-  const hopFee = (h: VisualHop) =>
-    h.fee_bps % 100 === 0 ? `${h.fee_bps / 100}%` : `${(h.fee_bps / 100).toFixed(2)}%`;
-
-  return (
-    <svg viewBox={`0 0 ${D_W} ${H}`} width="100%" style={{ display: "block" }}>
-      {/* ── Sections ── */}
-      {sections.map((sec, si) => {
-        const { x1, x2 } = bounds[si];
-
-        if (sec.type === "seq") {
-          // Sequential hops drawn on the center line
-          const n = sec.hops.length;
-          const isSeqSelected = selectedLane?.si === si && selectedLane?.li === 0;
-          return (
-            <g key={si}>
-              {isSeqSelected && (
-                <rect x={x1} y={cy - D_LANE_H / 2} width={x2 - x1} height={D_LANE_H}
-                  fill="#00d4ff05" stroke="#00d4ff" strokeWidth="1" strokeOpacity="0.35" rx="4"
-                  style={{ pointerEvents: "none" }} />
-              )}
-              {sec.hops.map((hop, j) => {
-                const hx1 = x1 + (j / n) * (x2 - x1);
-                const hx2 = x1 + ((j + 1) / n) * (x2 - x1);
-                const xm = (hx1 + hx2) / 2;
-                const pc = protocolColor(hop.protocol);
-                const lbl = `${protocolShort(hop.protocol)} ${hopFee(hop)}`;
-                const bw = lbl.length * 5.6 + 10;
-                return (
-                  <g key={j}>
-                    <line x1={hx1} y1={cy} x2={xm - bw / 2 - 3} y2={cy} stroke={pc} strokeWidth="1.5" />
-                    <rect x={xm - bw / 2} y={cy - 9} width={bw} height={18} rx={9}
-                      fill="#0d1117" stroke={pc} strokeWidth="1" strokeOpacity="0.9" />
-                    <text x={xm} y={cy + 4} textAnchor="middle" fontSize="8"
-                      fontFamily="monospace" fill={pc} style={{ pointerEvents: "none" }}>{lbl}</text>
-                    <line x1={xm + bw / 2 + 3} y1={cy} x2={hx2} y2={cy} stroke={pc} strokeWidth="1.5" />
-                  </g>
-                );
-              })}
-              {/* Clickable overlay — lets user select this hop to split it */}
-              <rect x={x1} y={cy - D_LANE_H / 2} width={x2 - x1} height={D_LANE_H}
-                fill="transparent" style={{ cursor: "pointer" }}
-                onClick={() => onLaneClick(si, 0, [100])} />
-            </g>
-          );
-        }
-
-        // Split block: fanout → parallel lanes → fanin
-        const nLegs = sec.legs.length;
-        const fanW = Math.min(30, (x2 - x1) * 0.18);
-        const lx1 = x1 + fanW;
-        const lx2 = x2 - fanW;
-        return (
-          <g key={si}>
-            {sec.legs.map((leg, li) => {
-              const y = laneY(li, nLegs);
-              const nHops = Math.max(leg.hops.length, 1);
-              const segW = (lx2 - lx1) / nHops;
-              const isSelected = nLegs > 1 && si === selectedLane?.si && li === selectedLane?.li;
-              const fc = isSelected ? "#00d4ff" : (nLegs > 1 ? "#3b4560" : (leg.hops[0] ? protocolColor(leg.hops[0].protocol) : "#3b4560"));
-              const laneTop = y - D_LANE_H / 2 + 6;
-              const laneH = D_LANE_H - 12;
-              return (
-                <g key={li}>
-                  {/* Selection highlight (behind everything) */}
-                  {isSelected && (
-                    <rect x={lx1 - 4} y={laneTop} width={lx2 - lx1 + 8} height={laneH}
-                      fill="#00d4ff0a" stroke="#00d4ff" strokeWidth="1" strokeOpacity="0.5" rx="4"
-                      style={{ pointerEvents: "none" }} />
-                  )}
-                  {/* Fan-out / fan-in */}
-                  <line x1={x1} y1={cy} x2={lx1} y2={y} stroke={fc}
-                    strokeWidth={isSelected ? "2" : "1.5"} strokeOpacity={isSelected ? 0.8 : 0.45} />
-                  <line x1={lx2} y1={y} x2={x2} y2={cy} stroke={fc}
-                    strokeWidth={isSelected ? "2" : "1.5"} strokeOpacity={isSelected ? 0.8 : 0.45} />
-                  {nLegs > 1 && (
-                    <text x={lx1 + 6} y={y < cy ? y - 9 : y + 18}
-                      fontSize="10" fontWeight="bold" fontFamily="monospace"
-                      fill={isSelected ? "#00d4ff" : "#00d4ffaa"} textAnchor="start">
-                      {(leg.fraction_bps / 100).toFixed(0)}%
-                    </text>
-                  )}
-                  {/* Hops within this leg */}
-                  {leg.hops.map((hop, j) => {
-                    const hx1 = lx1 + j * segW + (j > 0 ? D_INT_R + 2 : 0);
-                    const hx2 = lx1 + (j + 1) * segW;
-                    const xm = (hx1 + hx2) / 2;
-                    const pc = protocolColor(hop.protocol);
-                    const lbl = `${protocolShort(hop.protocol)} ${hopFee(hop)}`;
-                    const bw = lbl.length * 5.6 + 10;
-                    return (
-                      <g key={j}>
-                        {j > 0 && (
-                          <>
-                            <circle cx={lx1 + j * segW} cy={y} r={D_INT_R}
-                              fill={`${tokenColor(hop.token_in)}22`}
-                              stroke={tokenColor(hop.token_in)} strokeWidth="1.5" />
-                            <text x={lx1 + j * segW} y={y + 4} textAnchor="middle"
-                              fontSize={hop.token_in.length > 4 ? 6 : 8} fontWeight="bold"
-                              fontFamily="monospace" fill={tokenColor(hop.token_in)}
-                              style={{ pointerEvents: "none" }}>{hop.token_in}</text>
-                          </>
-                        )}
-                        <line x1={hx1} y1={y} x2={xm - bw / 2 - 3} y2={y} stroke={pc} strokeWidth="1.5" />
-                        <rect x={xm - bw / 2} y={y - 9} width={bw} height={18} rx={9}
-                          fill="#0d1117" stroke={pc} strokeWidth="1" strokeOpacity="0.9" />
-                        <text x={xm} y={y + 4} textAnchor="middle" fontSize="8"
-                          fontFamily="monospace" fill={pc} style={{ pointerEvents: "none" }}>{lbl}</text>
-                        <line x1={xm + bw / 2 + 3} y1={y} x2={hx2} y2={y} stroke={pc} strokeWidth="1.5" />
-                      </g>
-                    );
-                  })}
-                  {/* Clickable overlay rendered last so it sits above all lane content */}
-                  {nLegs > 1 && (
-                    <rect x={x1} y={y - D_LANE_H / 2} width={x2 - x1} height={D_LANE_H}
-                      fill="transparent" style={{ cursor: "pointer" }}
-                      onClick={() => onLaneClick(si, li, sec.legs.map((l) => Math.round(l.fraction_bps / 100)))} />
-                  )}
-                </g>
-              );
-            })}
-          </g>
-        );
-      })}
-
-      {/* ── Token nodes ── */}
-      {nodeSyms.map((sym, i) => {
-        const cx = nodeCx[i];
-        const r = nodeR(i);
-        const color = tokenColor(sym);
-        return (
-          <g key={i}>
-            <circle cx={cx} cy={cy} r={r} fill={`${color}22`} stroke={color} strokeWidth="1.5" />
-            <text x={cx} y={cy + 4} textAnchor="middle"
-              fontSize={sym.length > 4 ? (r >= D_NODE_R ? 7 : 6) : (r >= D_NODE_R ? 9 : 8)}
-              fontWeight="bold" fontFamily="monospace" fill={color}
-              style={{ pointerEvents: "none" }}>{sym}</text>
-          </g>
-        );
-      })}
-    </svg>
-  );
 }
 
 // ── Pool graph layout ─────────────────────────────────────────────────────────
@@ -525,6 +216,7 @@ export default function RoutingLabPage() {
   const [selectedSectionFracs, setSelectedSectionFracs] = useState<number[] | null>(null);
   const [quote, setQuote] = useState<QuoteResult | null>(null);
   const [quoting, setQuoting] = useState(false);
+  const [showGraph, setShowGraph] = useState(true);
   const [quoteError, setQuoteError] = useState<string | null>(null);
 
   // ── Load pools ──────────────────────────────────────────────────────────────
@@ -621,15 +313,15 @@ export default function RoutingLabPage() {
     if (!tokIn || !tokOut) return;
     setQuoting(true); setQuoteError(null);
     try {
-      const body: Record<string, unknown> = { token_in: tokIn, token_out: tokOut, amount_in: amountIn };
+      const baseBody: Record<string, unknown> = { token_in: tokIn, token_out: tokOut, amount_in: amountIn };
       if (waypoints.length > 2) {
-        body.path = waypoints.map((sym) => tokenNodes[sym]).filter(Boolean);
-        if (splitFractions !== null) body.split_fractions_bps = splitFractions.map((p) => p * 100);
+        baseBody.path = waypoints.map((sym) => tokenNodes[sym]).filter(Boolean);
+        if (splitFractions !== null) baseBody.split_fractions_bps = splitFractions.map((p) => p * 100);
       }
       const res = await fetch("/api/swap/quote", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(baseBody),
       });
       if (!res.ok) {
         const text = await res.text().catch(() => res.statusText);
@@ -648,9 +340,7 @@ export default function RoutingLabPage() {
 
   // ── URL state sync ───────────────────────────────────────────────────────────
 
-  // Restore state from URL on mount (runs once)
-  useEffect(() => {
-    const p = new URLSearchParams(window.location.search);
+  useUrlRestoreOnce((p) => {
     const t = p.get("t");
     const a = p.get("a");
     const s = p.get("s");
@@ -663,17 +353,14 @@ export default function RoutingLabPage() {
       const parts = s.split(",").map(Number);
       if (parts.length >= 2 && parts.every((n) => !isNaN(n) && n > 0)) setSplitFractions(parts);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  });
 
-  // Write state to URL whenever it changes (replaceState — no history entry)
-  useEffect(() => {
+  useUrlWrite(() => {
     const p = new URLSearchParams();
     if (waypoints.length > 0) p.set("t", waypoints.join(","));
     if (amountIn && amountIn !== "1") p.set("a", amountIn);
     if (splitFractions) p.set("s", splitFractions.join(","));
-    const qs = p.toString();
-    history.replaceState(null, "", qs ? `?${qs}` : window.location.pathname);
+    return p;
   }, [waypoints, amountIn, splitFractions]);
 
   // Reset manual split and selection when the path changes (skip during URL restore)
@@ -720,328 +407,266 @@ export default function RoutingLabPage() {
   // ── Render ──────────────────────────────────────────────────────────────────
 
   return (
-    <div className="max-w-5xl space-y-6">
+    <div className="max-w-6xl space-y-4">
       {/* Header */}
-      <div className="flex items-start justify-between">
+      <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-2xl font-bold text-[#e8eaf0] mb-2">Routing Lab</h2>
+          <h2 className="text-2xl font-bold text-[#e8eaf0] mb-1">Routing Lab</h2>
           <p className="text-sm text-muted">
             {loadingPools ? "Loading pool graph…" : poolError ? poolError
-              : `${symbols.length} tokens · ${edges.length} pools — drag nodes · click to chain hops`}
+              : `${symbols.length} tokens · ${edges.length} pools`}
           </p>
         </div>
-        <button
-          onClick={loadPools}
-          className="flex items-center gap-1.5 text-xs text-muted hover:text-[#e8eaf0] transition-colors mt-1"
-        >
-          <RefreshCw size={12} className={loadingPools ? "animate-spin" : ""} />
-          Refresh
-        </button>
+        <div className="flex items-center gap-2 mt-1 flex-shrink-0">
+          <button
+            onClick={() => setShowGraph((v) => !v)}
+            className="text-[10px] text-muted hover:text-[#e8eaf0] border border-border-dim rounded px-2 py-1 transition-colors"
+          >
+            {showGraph ? "Hide Graph" : "Pool Graph"}
+          </button>
+          <button
+            onClick={loadPools}
+            className="flex items-center gap-1.5 text-xs text-muted hover:text-[#e8eaf0] transition-colors"
+          >
+            <RefreshCw size={12} className={loadingPools ? "animate-spin" : ""} />
+            Refresh
+          </button>
+        </div>
       </div>
 
-      {/* Pool graph */}
-      <Card>
-        <CardContent className="p-0">
-          <div className="relative bg-[#0a0b0e] border border-border-dim rounded-xl overflow-hidden" style={{ height: SVG_H }}>
-            {loadingPools && (
-              <div className="absolute inset-0 flex items-center justify-center z-10 bg-[#0a0b0e]/80">
-                <Loader size={22} className="animate-spin text-cyan" />
-              </div>
-            )}
-            <PoolGraphSVG
-              symbols={symbols}
-              edges={edges}
-              positions={positions}
-              routePoolSet={routePoolSet}
-              selectedIn={selectedIn}
-              selectedOut={selectedOut}
-              svgRef={svgRef}
-              onPointerMove={onSvgPointerMove}
-              onNodePointerDown={onNodePointerDown}
-              onNodePointerUp={onNodePointerUp}
-            />
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Simulation controls + quote summary */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Controls */}
+      {/* Pool graph — collapsible */}
+      {showGraph && (
         <Card>
-          <CardContent className="pt-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-[#e8eaf0]">Route Simulation</h3>
-              {waypoints.length > 0 && (
-                <button
-                  onClick={() => { setWaypoints([]); setQuote(null); setQuoteError(null); }}
-                  className="text-[10px] text-muted hover:text-red-400 transition-colors"
-                >
-                  Reset
-                </button>
+          <CardContent className="p-0">
+            <div className="relative bg-[#0a0b0e] border border-border-dim rounded-xl overflow-hidden" style={{ height: SVG_H }}>
+              {loadingPools && (
+                <div className="absolute inset-0 flex items-center justify-center z-10 bg-[#0a0b0e]/80">
+                  <Loader size={22} className="animate-spin text-cyan" />
+                </div>
               )}
-            </div>
-            <p className="text-xs text-muted leading-relaxed">
-              Click nodes on the graph to chain hops, or use the path builder below.
-            </p>
-
-            {/* Path chain builder */}
-            <div className="flex items-center gap-1.5 flex-wrap min-h-[28px]">
-              {waypoints.length === 0 ? (
-                <select
-                  value=""
-                  onChange={(e) => { if (e.target.value) setWaypoints([e.target.value]); }}
-                  className="text-xs bg-[#0d1117] border border-border-dim rounded-md px-2 py-1 text-muted focus:outline-none focus:border-cyan/40"
-                >
-                  <option value="">Select start token…</option>
-                  {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
-                </select>
-              ) : (
-                <>
-                  {waypoints.map((sym, i) => (
-                    <div key={i} className="flex items-center gap-1">
-                      {i > 0 && <ArrowRight size={9} className="text-muted flex-shrink-0" />}
-                      <div className="flex items-center gap-0.5 rounded-md border border-border-dim bg-[#0d1117] px-1.5 py-0.5">
-                        <select
-                          value={sym}
-                          onChange={(e) => {
-                            const next = [...waypoints]; next[i] = e.target.value;
-                            setWaypoints(next); setQuote(null); setQuoteError(null);
-                          }}
-                          className="text-xs bg-transparent text-[#e8eaf0] focus:outline-none"
-                        >
-                          {symbols.map((s) => <option key={s} value={s} disabled={wouldConflict(waypoints, i, s)}>{s}</option>)}
-                        </select>
-                        <button
-                          onClick={() => { setWaypoints(waypoints.filter((_, j) => j !== i)); setQuote(null); setQuoteError(null); }}
-                          className="text-muted hover:text-red-400 ml-0.5 flex-shrink-0"
-                        >
-                          <X size={9} />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                  {/* Extend path */}
-                  <div className="flex items-center gap-1">
-                    <ArrowRight size={9} className="text-muted flex-shrink-0" />
-                    <select
-                      value=""
-                      onChange={(e) => {
-                        if (e.target.value) { setWaypoints([...waypoints, e.target.value]); setQuote(null); setQuoteError(null); }
-                      }}
-                      className="text-xs bg-[#0d1117] border border-border-dim rounded-md px-1.5 py-0.5 text-muted focus:outline-none focus:border-cyan/40"
-                    >
-                      <option value="">+ hop</option>
-                      {symbols.map((s) => <option key={s} value={s} disabled={wouldConflict(waypoints, -1, s)}>{s}</option>)}
-                    </select>
-                  </div>
-                </>
-              )}
-            </div>
-
-            <div>
-              <label className="text-[10px] text-muted uppercase tracking-wider block mb-1.5">Amount In</label>
-              <input
-                type="number" min="0" step="any" value={amountIn}
-                onChange={(e) => setAmountIn(e.target.value)}
-                className="w-full bg-[#0d1117] border border-border-dim rounded-lg px-3 py-1.5 text-xs text-[#e8eaf0] focus:outline-none focus:border-cyan/40"
-                placeholder="1.0"
+              <PoolGraphSVG
+                symbols={symbols}
+                edges={edges}
+                positions={positions}
+                routePoolSet={routePoolSet}
+                selectedIn={selectedIn}
+                selectedOut={selectedOut}
+                svgRef={svgRef}
+                onPointerMove={onSvgPointerMove}
+                onNodePointerDown={onNodePointerDown}
+                onNodePointerUp={onNodePointerUp}
               />
             </div>
           </CardContent>
         </Card>
-
-        {/* Quote summary */}
-        <Card>
-          <CardContent className="pt-5">
-            <h3 className="text-sm font-semibold text-[#e8eaf0] mb-3">Quote</h3>
-
-            {/* Spinner only when loading with no prior result */}
-            {quoting && !quote && (
-              <div className="flex items-center gap-2 text-xs text-muted">
-                <Loader size={12} className="animate-spin" />
-                Fetching best route…
-              </div>
-            )}
-            {quoteError && !quoting && (
-              <div className="rounded-lg bg-red-500/10 border border-red-500/20 px-3 py-2">
-                <p className="text-xs text-red-400">{quoteError}</p>
-              </div>
-            )}
-            {/* Keep previous result visible while re-fetching — just dim it */}
-            {quote && (
-              <div className="space-y-3" style={{ opacity: quoting ? 0.45 : 1, transition: "opacity 0.15s" }}>
-                <div className="flex items-center gap-2 bg-[#0d1117] border border-border-dim rounded-lg px-3 py-2">
-                  <span className="font-mono text-xs text-[#e8eaf0]">{amountIn} {quote.token_in}</span>
-                  <ArrowRight size={12} className="text-muted flex-shrink-0" />
-                  <span className="font-mono text-xs font-semibold ml-auto" style={{ color: "#00ff87" }}>
-                    {parseFloat(quote.amount_out_human).toPrecision(6)} {quote.token_out}
-                  </span>
-                </div>
-                {quote.price_impact !== "NaN" && (
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="text-muted">Price impact</span>
-                    <span className={
-                      parseFloat(quote.price_impact) * 100 > 5 ? "text-red-400"
-                        : parseFloat(quote.price_impact) * 100 > 1 ? "text-amber-400"
-                        : "text-green-400"
-                    }>
-                      {(parseFloat(quote.price_impact) * 100).toFixed(3)}%
-                    </span>
-                  </div>
-                )}
-                {/* Per-lane route breakdown */}
-                <div className="pt-1 border-t border-border-dim/50 space-y-2">
-                  {quoteLanes.map((lane, i) => (
-                    <div key={i} className="space-y-1">
-                      {quoteLanes.length > 1 && (
-                        <span className="text-[10px] font-mono font-bold text-cyan">
-                          {(lane.fraction_bps / 100).toFixed(0)}%
-                        </span>
-                      )}
-                      {lane.hops.map((hop, j) => (
-                        <div key={j} className="flex items-center gap-1.5 pl-2 text-xs">
-                          <span className="font-mono" style={{ color: tokenColor(hop.token_in) }}>{hop.token_in}</span>
-                          <ArrowRight size={9} className="text-muted flex-shrink-0" />
-                          <span className="font-mono" style={{ color: tokenColor(hop.token_out) }}>{hop.token_out}</span>
-                          <span
-                            className="ml-auto text-[10px] font-mono"
-                            style={{ color: protocolColor(hop.protocol) }}
-                          >
-                            {protocolShort(hop.protocol)} {hop.fee_bps % 100 === 0 ? `${hop.fee_bps / 100}%` : `${(hop.fee_bps / 100).toFixed(2)}%`}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-            {!quote && !quoting && !quoteError && (
-              <p className="text-xs text-muted">
-                {waypoints.length === 0
-                  ? "Build a path above, or click nodes on the graph."
-                  : waypoints.length === 1
-                  ? "Click another token to add the next hop."
-                  : ""}
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* route diagram — stays mounted while re-fetching to avoid layout jump */}
-      {quote && (
-        <Card style={{ opacity: quoting ? 0.45 : 1, transition: "opacity 0.15s" }}>
-          <CardContent className="pt-5 pb-4">
-            <div className="flex items-center justify-between mb-4 gap-4 flex-wrap">
-              <p className="text-[10px] text-muted uppercase tracking-wider">Route</p>
-              <div className="flex items-center gap-3 flex-wrap">
-                {waypoints.length > 2 && (() => {
-                  const fracs: number[] = splitFractions ?? selectedSectionFracs ?? autoFracs ?? [];
-                  if (fracs.length < 1) return null;
-
-                  const adjust = (i: number, delta: number) => {
-                    const next = [...fracs];
-                    const donor = i === fracs.length - 1 ? 0 : fracs.length - 1;
-                    const nI = next[i] + delta;
-                    const nD = next[donor] - delta;
-                    if (nI < 5 || nI > 95 || nD < 5) return;
-                    next[i] = nI; next[donor] = nD;
-                    setSplitFractions(next);
-                  };
-
-                  const selLi = selectedLane?.li ?? null;
-
-                  const addLeg = () => {
-                    const targetIdx = (selLi !== null && selLi < fracs.length)
-                      ? selLi
-                      : fracs.indexOf(Math.max(...fracs));
-                    const give = Math.floor(fracs[targetIdx] / 2 / 5) * 5;
-                    if (give < 5) return;
-                    const next = [...fracs];
-                    next[targetIdx] -= give;
-                    next.splice(targetIdx + 1, 0, give);
-                    setSplitFractions(next);
-                    setSelectedLane((prev) => ({ si: prev?.si ?? -1, li: targetIdx + 1 }));
-                  };
-
-                  const removeLeg = (i: number) => {
-                    if (fracs.length <= 2) return;
-                    const removed = fracs[i];
-                    const next = fracs.filter((_, j) => j !== i);
-                    next[next.length - 1] += removed;
-                    setSplitFractions(next);
-                    setSelectedLane((prev) => {
-                      if (prev === null || prev.li === i) return null;
-                      return prev.li > i ? { ...prev, li: prev.li - 1 } : prev;
-                    });
-                  };
-
-                  return (
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      <span className="text-[10px] text-muted">Split</span>
-                      {fracs.map((pct, i) => {
-                        const isSel = i === selLi;
-                        const isReadOnly = fracs.length === 1;
-                        return (
-                          <div key={i}
-                            onClick={() => !isReadOnly && setSelectedLane((prev) => (prev?.li === i) ? null : { si: prev?.si ?? -1, li: i })}
-                            className={`flex items-center gap-0.5 border rounded px-1 py-0.5 transition-colors ${
-                              isReadOnly
-                                ? "border-cyan/20 bg-cyan/5 cursor-default"
-                                : isSel
-                                  ? "border-cyan bg-cyan/15 ring-1 ring-cyan/40 cursor-pointer"
-                                  : "border-cyan/30 bg-cyan/5 hover:border-cyan/60 cursor-pointer"
-                            }`}>
-                            {!isReadOnly && (
-                              <div className="flex flex-col" style={{ lineHeight: 1 }}>
-                                <button onClick={(e) => { e.stopPropagation(); adjust(i, 5); }}
-                                  className="text-[7px] text-muted hover:text-cyan px-0.5">▲</button>
-                                <button onClick={(e) => { e.stopPropagation(); adjust(i, -5); }}
-                                  className="text-[7px] text-muted hover:text-cyan px-0.5">▼</button>
-                              </div>
-                            )}
-                            <span className={`text-[10px] font-mono w-7 text-center ${isSel && !isReadOnly ? "text-cyan font-bold" : "text-cyan/60"}`}>{pct}%</span>
-                            {fracs.length > 2 && (
-                              <button onClick={(e) => { e.stopPropagation(); removeLeg(i); }}
-                                className="text-[8px] text-muted hover:text-red-400 ml-0.5">×</button>
-                            )}
-                          </div>
-                        );
-                      })}
-                      {fracs.length > 1 && (
-                        <button onClick={addLeg}
-                          title={
-                            selectedLane && selectedSectionFracs === null
-                              ? "Add a parallel pool across all hops (splits apply globally)"
-                              : selLi !== null ? `Split lane ${selLi + 1}` : "Split largest lane"
-                          }
-                          className="text-[10px] text-muted hover:text-cyan border border-dashed border-border-dim rounded px-1.5 py-0.5">
-                          +
-                        </button>
-                      )}
-                      {splitFractions !== null && (
-                        <button onClick={() => { setSplitFractions(null); setSelectedLane(null); setSelectedSectionFracs(null); }}
-                          className="text-[10px] text-muted hover:text-[#e8eaf0] transition-colors">
-                          auto
-                        </button>
-                      )}
-                    </div>
-                  );
-                })()}
-                {quoteLanes.length > 1 && (
-                  <span className="text-[10px] font-mono text-cyan px-2 py-0.5 rounded-full border border-cyan/30 bg-cyan/5">
-                    split route
-                  </span>
-                )}
-              </div>
-            </div>
-            <div className="bg-[#0a0b0e] rounded-xl px-2 py-3">
-              <DAGDiagram dag={quote.dag} selectedLane={selectedLane} onLaneClick={handleLaneClick} />
-            </div>
-          </CardContent>
-        </Card>
       )}
+
+      {/* Main panel: path + amount + quote + route tree */}
+      <Card>
+        <CardContent className="pt-5 space-y-4">
+          {/* Row: title + reset */}
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-[#e8eaf0]">Route Simulation</h3>
+            {waypoints.length > 0 && (
+              <button
+                onClick={() => { setWaypoints([]); setQuote(null); setQuoteError(null); }}
+                className="text-[10px] text-muted hover:text-red-400 transition-colors"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+
+          {/* Path chain builder */}
+          <div className="flex items-center gap-1.5 flex-wrap min-h-[28px]">
+            {waypoints.length === 0 ? (
+              <select
+                value=""
+                onChange={(e) => { if (e.target.value) setWaypoints([e.target.value]); }}
+                className="text-xs bg-[#0d1117] border border-border-dim rounded-md px-2 py-1 text-muted focus:outline-none focus:border-cyan/40"
+              >
+                <option value="">Select start token…</option>
+                {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            ) : (
+              <>
+                {waypoints.map((sym, i) => (
+                  <div key={i} className="flex items-center gap-1">
+                    {i > 0 && <ArrowRight size={9} className="text-muted flex-shrink-0" />}
+                    <div className="flex items-center gap-0.5 rounded-md border border-border-dim bg-[#0d1117] px-1.5 py-0.5">
+                      <select
+                        value={sym}
+                        onChange={(e) => {
+                          const next = [...waypoints]; next[i] = e.target.value;
+                          setWaypoints(next); setQuote(null); setQuoteError(null);
+                        }}
+                        className="text-xs bg-transparent text-[#e8eaf0] focus:outline-none"
+                      >
+                        {symbols.map((s) => <option key={s} value={s} disabled={wouldConflict(waypoints, i, s)}>{s}</option>)}
+                      </select>
+                      <button
+                        onClick={() => { setWaypoints(waypoints.filter((_, j) => j !== i)); setQuote(null); setQuoteError(null); }}
+                        className="text-muted hover:text-red-400 ml-0.5 flex-shrink-0"
+                      >
+                        <X size={9} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                <div className="flex items-center gap-1">
+                  <ArrowRight size={9} className="text-muted flex-shrink-0" />
+                  <select
+                    value=""
+                    onChange={(e) => {
+                      if (e.target.value) { setWaypoints([...waypoints, e.target.value]); setQuote(null); setQuoteError(null); }
+                    }}
+                    className="text-xs bg-[#0d1117] border border-border-dim rounded-md px-1.5 py-0.5 text-muted focus:outline-none focus:border-cyan/40"
+                  >
+                    <option value="">+ hop</option>
+                    {symbols.map((s) => <option key={s} value={s} disabled={wouldConflict(waypoints, -1, s)}>{s}</option>)}
+                  </select>
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Amount in */}
+          <div>
+            <label className="text-[10px] text-muted uppercase tracking-wider block mb-1.5">Amount In</label>
+            <input
+              type="number" min="0" step="any" value={amountIn}
+              onChange={(e) => setAmountIn(e.target.value)}
+              className="w-full bg-[#0d1117] border border-border-dim rounded-lg px-3 py-1.5 text-xs text-[#e8eaf0] focus:outline-none focus:border-cyan/40"
+              placeholder="1.0"
+            />
+          </div>
+
+          {/* Quote status */}
+          {quoting && !quote && (
+            <div className="flex items-center gap-2 text-xs text-muted">
+              <Loader size={12} className="animate-spin" /> Fetching best route…
+            </div>
+          )}
+          {quoteError && !quoting && (
+            <div className="rounded-lg bg-red-500/10 border border-red-500/20 px-3 py-2">
+              <p className="text-xs text-red-400">{quoteError}</p>
+            </div>
+          )}
+          {!quote && !quoting && !quoteError && (
+            <p className="text-xs text-muted">
+              {waypoints.length === 0
+                ? "Build a path above, or click nodes on the graph."
+                : waypoints.length === 1 ? "Add the next hop." : ""}
+            </p>
+          )}
+
+          {/* Quote result + route tree */}
+          {quote && (
+            <div style={{ opacity: quoting ? 0.45 : 1, transition: "opacity 0.15s" }} className="space-y-3">
+              {/* Amount row */}
+              <div className="flex items-center gap-2 bg-[#0d1117] border border-border-dim rounded-lg px-3 py-2">
+                <span className="font-mono text-xs text-[#e8eaf0]">{amountIn} {quote.token_in}</span>
+                <ArrowRight size={12} className="text-muted flex-shrink-0" />
+                <span className="font-mono text-xs font-semibold ml-auto" style={{ color: "#00ff87" }}>
+                  {parseFloat(quote.amount_out_human).toPrecision(6)} {quote.token_out}
+                </span>
+                {quote.price_impact !== "NaN" && (
+                  <span className={`text-[10px] font-mono ${
+                    parseFloat(quote.price_impact) * 100 > 5 ? "text-red-400"
+                      : parseFloat(quote.price_impact) * 100 > 1 ? "text-amber-400"
+                      : "text-green-400"
+                  }`}>
+                    ({(parseFloat(quote.price_impact) * 100).toFixed(3)}% impact)
+                  </span>
+                )}
+              </div>
+
+              {/* Route tree */}
+              <div className="bg-[#0a0b0e] rounded-xl p-3">
+                <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] text-muted uppercase tracking-wider">Route</span>
+                    {quoteLanes.length > 1 && (
+                      <span className="text-[10px] font-mono text-cyan px-2 py-0.5 rounded-full border border-cyan/30 bg-cyan/5">
+                        split
+                      </span>
+                    )}
+                  </div>
+                  {/* Split fraction controls */}
+                  {waypoints.length > 2 && (() => {
+                    const fracs: number[] = splitFractions ?? selectedSectionFracs ?? autoFracs ?? [];
+                    if (fracs.length < 1) return null;
+                    const selLi = selectedLane?.li ?? null;
+                    const adjust = (i: number, delta: number) => {
+                      const next = [...fracs];
+                      const donor = i === fracs.length - 1 ? 0 : fracs.length - 1;
+                      const nI = next[i] + delta; const nD = next[donor] - delta;
+                      if (nI < 5 || nI > 95 || nD < 5) return;
+                      next[i] = nI; next[donor] = nD; setSplitFractions(next);
+                    };
+                    const addLeg = () => {
+                      const targetIdx = (selLi !== null && selLi < fracs.length)
+                        ? selLi : fracs.indexOf(Math.max(...fracs));
+                      const give = Math.floor(fracs[targetIdx] / 2 / 5) * 5;
+                      if (give < 5) return;
+                      const next = [...fracs]; next[targetIdx] -= give;
+                      next.splice(targetIdx + 1, 0, give); setSplitFractions(next);
+                      setSelectedLane((prev) => ({ si: prev?.si ?? -1, li: targetIdx + 1 }));
+                    };
+                    const removeLeg = (i: number) => {
+                      if (fracs.length <= 2) return;
+                      const removed = fracs[i];
+                      const next = fracs.filter((_, j) => j !== i);
+                      next[next.length - 1] += removed; setSplitFractions(next);
+                      setSelectedLane((prev) => {
+                        if (prev === null || prev.li === i) return null;
+                        return prev.li > i ? { ...prev, li: prev.li - 1 } : prev;
+                      });
+                    };
+                    return (
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-[10px] text-muted">Split</span>
+                        {fracs.map((pct, i) => {
+                          const isSel = i === selLi; const isReadOnly = fracs.length === 1;
+                          return (
+                            <div key={i}
+                              onClick={() => !isReadOnly && setSelectedLane((prev) => (prev?.li === i) ? null : { si: prev?.si ?? -1, li: i })}
+                              className={`flex items-center gap-0.5 border rounded px-1 py-0.5 transition-colors ${
+                                isReadOnly ? "border-cyan/20 bg-cyan/5 cursor-default"
+                                  : isSel ? "border-cyan bg-cyan/15 ring-1 ring-cyan/40 cursor-pointer"
+                                  : "border-cyan/30 bg-cyan/5 hover:border-cyan/60 cursor-pointer"}`}>
+                              {!isReadOnly && (
+                                <div className="flex flex-col" style={{ lineHeight: 1 }}>
+                                  <button onClick={(e) => { e.stopPropagation(); adjust(i, 5); }} className="text-[7px] text-muted hover:text-cyan px-0.5">▲</button>
+                                  <button onClick={(e) => { e.stopPropagation(); adjust(i, -5); }} className="text-[7px] text-muted hover:text-cyan px-0.5">▼</button>
+                                </div>
+                              )}
+                              <span className={`text-[10px] font-mono w-7 text-center ${isSel && !isReadOnly ? "text-cyan font-bold" : "text-cyan/60"}`}>{pct}%</span>
+                              {fracs.length > 2 && (
+                                <button onClick={(e) => { e.stopPropagation(); removeLeg(i); }} className="text-[8px] text-muted hover:text-red-400 ml-0.5">×</button>
+                              )}
+                            </div>
+                          );
+                        })}
+                        {fracs.length > 1 && (
+                          <button onClick={addLeg}
+                            title={selectedLane && selectedSectionFracs === null ? "Add a parallel pool across all hops" : selLi !== null ? `Split lane ${selLi + 1}` : "Split largest lane"}
+                            className="text-[10px] text-muted hover:text-cyan border border-dashed border-border-dim rounded px-1.5 py-0.5">+</button>
+                        )}
+                        {splitFractions !== null && (
+                          <button onClick={() => { setSplitFractions(null); setSelectedLane(null); setSelectedSectionFracs(null); }}
+                            className="text-[10px] text-muted hover:text-[#e8eaf0] transition-colors">auto</button>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
+                <RouteTree dag={quote.dag} selectedLane={selectedLane} onLaneClick={handleLaneClick} />
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

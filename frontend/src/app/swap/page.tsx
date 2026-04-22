@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import useSWR from "swr";
 import {
   useAccount,
@@ -20,175 +20,21 @@ import {
   ArrowDownUp,
   ChevronDown,
   AlertCircle,
-  Info,
   CheckCircle,
   ExternalLink,
   Loader,
+  X,
 } from "lucide-react";
+import { RouteTree, type RouteDAGData as _RouteDAGData } from "@/components/ui/route-tree";
+import { useUrlRestore, useUrlWrite } from "@/lib/use-url-state";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 // ---------------------------------------------------------------------------
-// DAG visualizer
+// Local DAG types (re-used from shared component via import alias)
 // ---------------------------------------------------------------------------
 
-interface DAGSwap {
-  type: "swap";
-  token_out: string;
-  pool_address: string;
-  protocol: string;
-  fee_bps: number;
-}
-
-interface DAGSplit {
-  type: "split";
-  token_out: string;
-  legs: { fraction_bps: number; actions: DAGAction[] }[];
-}
-
-type DAGAction = DAGSwap | DAGSplit;
-
-interface RouteDAGData {
-  token_in: string;
-  actions: DAGAction[];
-}
-
-const ROUTE_COLORS = ["#00d4ff", "#8b5cf6", "#00ff87", "#f59e0b"];
-
-function normalizeProtocol(protocol: string): string {
-  const p = protocol.toUpperCase();
-  if (p.includes("V4")) return "V4";
-  if (p.includes("V3")) return "V3";
-  if (p.includes("V2")) return "V2";
-  return p.slice(0, 6);
-}
-
-function TokenNode({ symbol, color }: { symbol: string; color: string }) {
-  return (
-    <span
-      className="text-xs font-semibold px-2 py-0.5 rounded-md border"
-      style={{ color, borderColor: `${color}30`, backgroundColor: `${color}10` }}
-    >
-      {symbol}
-    </span>
-  );
-}
-
-function PoolHopNode({ action, color }: { action: DAGSwap; color: string }) {
-  const proto = normalizeProtocol(action.protocol);
-  return (
-    <div
-      className="flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs"
-      style={{ borderColor: `${color}25`, backgroundColor: `${color}08` }}
-    >
-      <span className="text-muted font-mono text-[10px]">
-        {action.pool_address.slice(0, 6)}…{action.pool_address.slice(-4)}
-      </span>
-      <Badge
-        variant={proto.includes("3") || proto.includes("4") ? "cyan" : "purple"}
-        className="text-[9px] px-1 py-0"
-      >
-        {proto}
-      </Badge>
-      <span className="text-muted text-[10px]">{action.fee_bps / 100}%</span>
-    </div>
-  );
-}
-
-/** Renders a flat sequence of swap actions as a horizontal hop chain. */
-function LegChain({ tokenIn, actions, color }: { tokenIn: string; actions: DAGAction[]; color: string }) {
-  const swaps = actions.filter((a): a is DAGSwap => a.type === "swap");
-  return (
-    <div className="overflow-x-auto">
-      <div className="flex items-center gap-1.5 min-w-max">
-        <TokenNode symbol={tokenIn} color={color} />
-        {swaps.map((action, i) => (
-          <div key={i} className="flex items-center gap-1.5 flex-shrink-0">
-            <span className="text-muted text-xs">→</span>
-            <PoolHopNode action={action} color={color} />
-            <span className="text-muted text-xs">→</span>
-            <TokenNode symbol={action.token_out} color={color} />
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function DAGVisualizer({ dag, isNativeIn }: { dag?: RouteDAGData | null; isNativeIn: boolean }) {
-  // Flatten to a list of legs: { color, pct, tokenIn, actions }
-  const legs = useMemo(() => {
-    if (!dag) return null;
-    const splitIdx = dag.actions.findIndex((a) => a.type === "split");
-    if (splitIdx === -1) {
-      return [{ color: ROUTE_COLORS[0], pct: 100, tokenIn: dag.token_in, actions: dag.actions }];
-    }
-    const split = dag.actions[splitIdx] as DAGSplit;
-    // token at the split input = last token produced by any pre-split swaps
-    let splitTokenIn = dag.token_in;
-    for (let i = 0; i < splitIdx; i++) {
-      const a = dag.actions[i];
-      if (a.type === "swap") splitTokenIn = a.token_out;
-    }
-    return split.legs.map((leg, i) => ({
-      color: ROUTE_COLORS[i % ROUTE_COLORS.length],
-      pct: leg.fraction_bps / 100,
-      tokenIn: splitTokenIn,
-      actions: leg.actions,
-    }));
-  }, [dag]);
-
-  return (
-    <div className="space-y-3">
-      {isNativeIn && (
-        <div className="flex items-center gap-2 text-xs text-amber-400/80 bg-amber-500/8 border border-amber-500/20 rounded-lg px-3 py-2">
-          <span className="font-semibold">ETH</span>
-          <span className="text-muted">→</span>
-          <span className="font-mono bg-amber-500/15 border border-amber-500/25 rounded px-1.5 py-0.5">WRAP</span>
-          <span className="text-muted">→</span>
-          <span className="font-semibold">WETH</span>
-          <span className="text-muted ml-1">auto-wrapped atomically</span>
-        </div>
-      )}
-
-      {!legs ? (
-        /* placeholder before any quote */
-        <div className="flex items-center gap-1.5 opacity-40">
-          <TokenNode symbol={isNativeIn ? "WETH" : "—"} color={ROUTE_COLORS[0]} />
-          <span className="text-muted text-xs">→</span>
-          <div className="flex items-center gap-1 px-2 py-0.5 rounded-md border border-border-dim text-xs">
-            <span className="text-muted font-mono text-[10px]">0x????…????</span>
-            <span className="text-muted text-[10px]">V3</span>
-          </div>
-          <span className="text-muted text-xs">→</span>
-          <TokenNode symbol="—" color={ROUTE_COLORS[0]} />
-        </div>
-      ) : (
-        legs.map((leg, i) => (
-          <div key={i} className="flex items-center gap-2">
-            {/* pct + glow bar */}
-            <div className="flex-shrink-0 flex items-center gap-1.5 w-[4.5rem]">
-              <div className="relative flex-1 h-1.5 rounded-full bg-border-dim">
-                <div
-                  className="absolute left-0 top-0 h-full rounded-full"
-                  style={{
-                    width: `${leg.pct}%`,
-                    backgroundColor: leg.color,
-                    boxShadow: `0 0 6px ${leg.color}80`,
-                  }}
-                />
-              </div>
-              <span className="text-[10px] font-mono font-bold flex-shrink-0" style={{ color: leg.color }}>
-                {leg.pct}%
-              </span>
-            </div>
-            <LegChain tokenIn={leg.tokenIn} actions={leg.actions} color={leg.color} />
-          </div>
-        ))
-      )}
-    </div>
-  );
-}
+type RouteDAGData = _RouteDAGData;
 
 // ---------------------------------------------------------------------------
 // Main page
@@ -364,6 +210,19 @@ export default function SwapPage() {
     return () => clearTimeout(timer);
   }, [amountIn, tokenIn, tokenOut, exceedsBalance, fetchQuote, isNativeIn, isNativeOut]);
 
+  // ── URL state sync ───────────────────────────────────────────────────────────
+
+  useUrlRestore({ from: setTokenIn, to: setTokenOut, amount: setAmountIn, slippage: setSlippage });
+
+  useUrlWrite(() => {
+    const p = new URLSearchParams();
+    p.set("from", tokenIn);
+    p.set("to", tokenOut);
+    if (amountIn) p.set("amount", amountIn);
+    if (slippage !== "0.5") p.set("slippage", slippage);
+    return p;
+  }, [tokenIn, tokenOut, amountIn, slippage]);
+
   // ---------------------------------------------------------------------------
   // Transaction
   // ---------------------------------------------------------------------------
@@ -429,8 +288,10 @@ export default function SwapPage() {
   const impactLabel = impactNum === null ? "—" : `${impactNum.toFixed(2)}%`;
   const impactColor = impactNum === null ? "text-muted" : impactNum > 5 ? "text-red-400" : impactNum > 1 ? "text-amber-400" : "text-green";
 
+  const [showRouteModal, setShowRouteModal] = useState(false);
+
   return (
-    <div className="max-w-lg mx-auto space-y-4">
+    <div className="max-w-lg mx-auto space-y-4 pt-6">
       <Card glow>
         <CardHeader>
           <CardTitle>Swap</CardTitle>
@@ -665,35 +526,76 @@ export default function SwapPage() {
         </CardContent>
       </Card>
 
-      {/* DAG route visualizer */}
-      <Card>
+      {/* Route visualizer */}
+      <Card
+        onClick={quoteDag ? () => setShowRouteModal(true) : undefined}
+        className={quoteDag ? "cursor-pointer hover:border-cyan/30 transition-colors" : ""}
+      >
         <CardHeader>
           <CardTitle>Route</CardTitle>
-          <Badge variant={quoteDag ? "cyan" : "muted"}>{quoteDag ? "Live" : "—"}</Badge>
-        </CardHeader>
-        <CardContent>
-          <div className="mb-4 pb-3 border-b border-border-dim flex items-center justify-between text-xs">
-            <span className="text-muted">{tokenIn} → {tokenOut}</span>
-            <span className="text-muted">
-              {quoteDag
-                ? (() => {
-                    const split = quoteDag.actions.find((a) => a.type === "split") as DAGSplit | undefined;
-                    if (split) return `split · ${split.legs.length} legs`;
-                    const hops = quoteDag.actions.filter((a) => a.type === "swap").length;
-                    return `${hops} hop${hops !== 1 ? "s" : ""}`;
-                  })()
-                : "awaiting quote"}
-            </span>
+          <div className="flex items-center gap-2">
+            <Badge variant={quoteDag ? "cyan" : "muted"}>{quoteDag ? "Live" : "—"}</Badge>
+            {quoteDag && <span className="text-[10px] text-muted">click to expand</span>}
           </div>
-          <DAGVisualizer dag={quoteDag} isNativeIn={isNativeIn} />
-          {!quoteDag && (
-            <p className="text-xs text-muted mt-4 italic flex items-center gap-1.5">
-              <Info size={10} />
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {isNativeIn && quoteDag && (
+            <div className="flex items-center gap-2 text-xs text-amber-400/80 bg-amber-500/8 border border-amber-500/20 rounded-lg px-3 py-2">
+              <span className="font-semibold">ETH</span>
+              <span className="text-muted">→</span>
+              <span className="font-mono bg-amber-500/15 border border-amber-500/25 rounded px-1.5 py-0.5">WRAP</span>
+              <span className="text-muted">→</span>
+              <span className="font-semibold">WETH</span>
+              <span className="text-muted ml-1">auto-wrapped atomically</span>
+            </div>
+          )}
+          {quoteDag ? (
+            <div className="bg-[#0a0b0e] rounded-xl p-3 pointer-events-none">
+              <RouteTree dag={quoteDag} />
+            </div>
+          ) : (
+            <p className="text-xs text-muted italic">
               Enter an amount to see the live route.
             </p>
           )}
         </CardContent>
       </Card>
+
+      {/* Route expand modal */}
+      {showRouteModal && quoteDag && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+          onClick={() => setShowRouteModal(false)}
+        >
+          <div
+            className="bg-[#0d1117] border border-border-dim rounded-2xl w-full max-w-5xl shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-border-dim">
+              <div className="flex items-center gap-3">
+                <span className="text-sm font-semibold text-[#e8eaf0]">Route</span>
+                <Badge variant="cyan">Live</Badge>
+                {isNativeIn && (
+                  <span className="text-[10px] text-amber-400/80 bg-amber-500/8 border border-amber-500/20 rounded px-1.5 py-0.5">
+                    ETH → WRAP → WETH
+                  </span>
+                )}
+              </div>
+              <button
+                onClick={() => setShowRouteModal(false)}
+                className="text-muted hover:text-[#e8eaf0] transition-colors p-1 rounded-lg hover:bg-white/5"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            {/* Modal route tree */}
+            <div className="p-5 bg-[#0a0b0e] rounded-b-2xl">
+              <RouteTree dag={quoteDag} large />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -7,10 +7,10 @@ export const config = createConfig({
   connectors: [injected()],
   ssr: true, // defer reconnection until after hydration to avoid SSR mismatch
   transports: {
-    [mainnet.id]: http(),
-    [sepolia.id]: http(),
-    [base.id]: http(),
-    [arbitrum.id]: http(),
-    [polygon.id]: http(),
+    [mainnet.id]:  http("https://cloudflare-eth.com"),
+    [sepolia.id]:  http("https://rpc.sepolia.org"),
+    [base.id]:     http("https://mainnet.base.org"),
+    [arbitrum.id]: http("https://arb1.arbitrum.io/rpc"),
+    [polygon.id]:  http("https://polygon-rpc.com"),
   },
 });

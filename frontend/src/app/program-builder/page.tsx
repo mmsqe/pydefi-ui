@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useUrlRestoreOnce, useUrlWrite } from "@/lib/use-url-state";
 import { useAccount } from "wagmi";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
@@ -484,9 +485,7 @@ export default function ProgramBuilderPage() {
 
   // ── URL state sync ───────────────────────────────────────────────────────────
 
-  // Restore state from URL on mount (runs once)
-  useEffect(() => {
-    const p = new URLSearchParams(window.location.search);
+  useUrlRestoreOnce((p) => {
     const steps = p.getAll("step");
     const s = p.get("sender");
     if (steps.length === 0 && !s) return;
@@ -502,16 +501,13 @@ export default function ProgramBuilderPage() {
       if (restored.length > 0) setBlocks(restored);
     }
     if (s) setSender(s);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  });
 
-  // Write state to URL whenever it changes (replaceState — no history entry)
-  useEffect(() => {
+  useUrlWrite(() => {
     const p = new URLSearchParams();
     for (const block of blocks) p.append("step", serializeBlock(block));
     if (sender) p.set("sender", sender);
-    const qs = p.toString();
-    history.replaceState(null, "", qs ? `?${qs}` : window.location.pathname);
+    return p;
   }, [blocks, sender]);
 
   // Load pools once for token symbol lists

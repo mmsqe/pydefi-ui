@@ -151,6 +151,21 @@ const CCTP_CHAINS: Record<string, { label: string; domain: number }> = {
 
 // ── Pseudo-bytecode assembler ─────────────────────────────────────────────────
 
+function renderDagActions(actions: DAGAction[], lines: string[], indent: string): void {
+  for (const action of actions) {
+    if (action.type === "swap") {
+      lines.push(`${indent}via ${action.protocol} pool  fee=${action.fee_bps / 100}%`);
+    } else if (action.type === "split") {
+      lines.push(`${indent}SPLIT →`);
+      for (const leg of action.legs) {
+        const pct = (leg.fraction_bps / 100).toFixed(0);
+        lines.push(`${indent}  leg ${pct}%:`);
+        renderDagActions(leg.actions, lines, indent + "    ");
+      }
+    }
+  }
+}
+
 function assemblePseudo(
   blocks: CanvasBlock[],
   quotes: Record<string, QuoteState>,
@@ -188,13 +203,11 @@ function assemblePseudo(
         const minOut = q?.amount_out_human
           ? ` → ~${parseFloat(q.amount_out_human).toPrecision(5)} ${c.token_out} (${c.slippage_bps ?? "50"} bps slippage)`
           : "";
-        lines.push(`; build_multi_hop_program(swap_route_to_hops(route, defi_vm, sender))`);
+        const hasSplit = q?.dag?.actions.some((a) => a.type === "split");
+        lines.push(`; build_${hasSplit ? "execution_program_for_dag" : "hops_program"}(${hasSplit ? "dag" : "swap_route_to_hops(route, defi_vm, sender)"})`);
         lines.push(`SWAP  ${c.amount_in ?? "?"} ${c.token_in ?? "?"} → ${c.token_out ?? "?"}${minOut}`);
         if (q?.dag) {
-          const swaps = q.dag.actions.filter((a): a is DAGSwap => a.type === "swap");
-          swaps.forEach((s) => {
-            lines.push(`        via ${s.protocol} pool  fee=${s.fee_bps / 100}%`);
-          });
+          renderDagActions(q.dag.actions, lines, "        ");
         }
         lines.push(`POP`);
         break;
@@ -351,6 +364,32 @@ function BlockConfigForm({
               )}
             </div>
           </div>
+          {/* Split route legs */}
+          {quote?.dag && !quote.loading && (() => {
+            const splitAction = quote.dag!.actions.find((a): a is DAGSplit => a.type === "split");
+            if (!splitAction) return null;
+            return (
+              <div className="rounded-lg border border-white/5 bg-[#0a0b0e] p-2.5 space-y-1.5">
+                <p className="text-[10px] uppercase tracking-wider text-muted mb-1.5">Split route</p>
+                {splitAction.legs.map((leg, li) => (
+                  <div key={li} className="flex items-start gap-2">
+                    <span className="text-[10px] font-mono font-bold w-10 flex-shrink-0"
+                      style={{ color: "#a78bfa" }}>
+                      {(leg.fraction_bps / 100).toFixed(0)}%
+                    </span>
+                    <div className="flex flex-col gap-0.5">
+                      {leg.actions.filter((a): a is DAGSwap => a.type === "swap").map((s, si) => (
+                        <span key={si} className="text-[10px] text-[#94a3b8] font-mono">
+                          {s.protocol}  fee={s.fee_bps / 100}%
+                          <span className="text-muted ml-1.5">{s.pool_address.slice(0, 10)}…</span>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
         </div>
       );
 
@@ -398,6 +437,35 @@ function BlockConfigForm({
   }
 }
 
+// ── URL serialization ─────────────────────────────────────────────────────────
+
+const BLOCK_FIELD_ORDER: Record<BlockType, (keyof BlockConfig)[]> = {
+  wrap_eth:      ["amount"],
+  unwrap_weth:   ["amount"],
+  approve:       ["token", "spender"],
+  transfer:      ["token", "amount", "recipient"],
+  swap:          ["token_in", "token_out", "amount_in", "slippage_bps"],
+  cctp_bridge:   ["destination_chain", "cctp_amount"],
+  call_contract: ["contract_address", "call_value", "calldata"],
+};
+
+function serializeBlock(block: CanvasBlock): string {
+  const fields = BLOCK_FIELD_ORDER[block.type];
+  const values = fields.map((f) => block.config[f] ?? "");
+  while (values.length > 0 && values[values.length - 1] === "") values.pop();
+  return [block.type, ...values].join(":");
+}
+
+function deserializeBlock(s: string): { type: BlockType; config: BlockConfig } | null {
+  const parts = s.split(":");
+  const type = parts[0] as BlockType;
+  const fields = BLOCK_FIELD_ORDER[type];
+  if (!fields) return null;
+  const config: BlockConfig = {};
+  fields.forEach((f, i) => { if (parts[i + 1]) config[f] = parts[i + 1]; });
+  return { type, config };
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function ProgramBuilderPage() {
@@ -413,6 +481,38 @@ export default function ProgramBuilderPage() {
   const [senderError, setSenderError] = useState(false);
   const [invalidBlockId, setInvalidBlockId] = useState<string | null>(null);
   const quoteTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+
+  // ── URL state sync ───────────────────────────────────────────────────────────
+
+  // Restore state from URL on mount (runs once)
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search);
+    const steps = p.getAll("step");
+    const s = p.get("sender");
+    if (steps.length === 0 && !s) return;
+    if (steps.length > 0) {
+      const restored: CanvasBlock[] = steps
+        .map(deserializeBlock)
+        .filter((x): x is NonNullable<typeof x> => x !== null)
+        .map((item) => ({
+          id: `b-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          type: item.type,
+          config: item.config,
+        }));
+      if (restored.length > 0) setBlocks(restored);
+    }
+    if (s) setSender(s);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Write state to URL whenever it changes (replaceState — no history entry)
+  useEffect(() => {
+    const p = new URLSearchParams();
+    for (const block of blocks) p.append("step", serializeBlock(block));
+    if (sender) p.set("sender", sender);
+    const qs = p.toString();
+    history.replaceState(null, "", qs ? `?${qs}` : window.location.pathname);
+  }, [blocks, sender]);
 
   // Load pools once for token symbol lists
   useEffect(() => {
@@ -551,7 +651,7 @@ export default function ProgramBuilderPage() {
     const timers = quoteTimers.current;
     return () => { Object.values(timers).forEach(clearTimeout); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [blocks]);
+  }, [blocks, tokenNodes]);
 
   // ── Run / build ──────────────────────────────────────────────────────────
 
@@ -737,8 +837,11 @@ export default function ProgramBuilderPage() {
                               : `${def.color}18`,
                         }}
                       >
-                        {/* Header row */}
-                        <div className="flex items-center gap-2.5 px-3 py-2.5">
+                        {/* Header row — click anywhere to toggle */}
+                        <div
+                          className="flex items-center gap-2.5 px-3 py-2.5 cursor-pointer select-none"
+                          onClick={() => setExpanded((e) => (e === block.id ? null : block.id))}
+                        >
                           {/* Step number */}
                           <div
                             className="w-6 h-6 rounded-md flex items-center justify-center text-[10px] font-bold font-mono flex-shrink-0"
@@ -755,8 +858,16 @@ export default function ProgramBuilderPage() {
 
                           {/* Quote badge */}
                           {block.type === "swap" && quotes[block.id]?.amount_out_human && !quotes[block.id]?.loading && (
-                            <span className="text-[10px] text-green-400 font-mono hidden sm:block">
+                            <span className="text-[10px] text-green-400 font-mono">
                               ≈{parseFloat(quotes[block.id].amount_out_human!).toPrecision(4)} {block.config.token_out}
+                            </span>
+                          )}
+                          {block.type === "swap" && quotes[block.id]?.dag?.actions.some((a) => a.type === "split") && !quotes[block.id]?.loading && (
+                            <span
+                              className="text-[10px] px-1.5 py-0.5 rounded-md flex items-center gap-1"
+                              style={{ backgroundColor: "#8b5cf615", color: "#a78bfa", border: "1px solid #8b5cf630" }}
+                            >
+                              split ↓
                             </span>
                           )}
                           {block.type === "swap" && quotes[block.id]?.loading && (
@@ -764,7 +875,7 @@ export default function ProgramBuilderPage() {
                           )}
 
                           {/* Controls */}
-                          <div className="flex items-center gap-0.5">
+                          <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
                             <button onClick={() => moveBlock(block.id, -1)} disabled={index === 0}
                               className="p-1 rounded hover:bg-white/5 text-muted disabled:opacity-20 transition-colors">
                               <ArrowUp size={11} />

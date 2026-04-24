@@ -4,8 +4,8 @@ import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
 import { useUrlRestoreOnce, useUrlWrite } from "@/lib/use-url-state";
 import { Card, CardContent } from "@/components/ui/card";
 import { Loader, RefreshCw, ArrowRight, X } from "lucide-react";
-import { fetchPools } from "@/lib/api";
-import type { Pool } from "@/lib/types";
+import { fetchPools, fetchQuote as apiFetchQuote, fetchQuoteOnChain } from "@/lib/api";
+import type { Pool, SwapRequest } from "@/lib/types";
 import {
   RouteTree, flattenDAG, tokenColor, protocolColor,
   type DAGAction, type RouteDAGData,
@@ -22,6 +22,9 @@ interface GraphEdge {
 interface QuoteResult {
   amount_out: string; amount_out_human: string; price_impact: string;
   token_in: string; token_out: string; dag: RouteDAGData;
+  on_chain_amount_out?: string;
+  on_chain_amount_out_human?: string;
+  on_chain_quote_note?: string;
 }
 
 /** Returns true if picking `token` at position `changeIdx` (−1 = append) would
@@ -216,6 +219,9 @@ export default function RoutingLabPage() {
   const [selectedSectionFracs, setSelectedSectionFracs] = useState<number[] | null>(null);
   const [quote, setQuote] = useState<QuoteResult | null>(null);
   const [quoting, setQuoting] = useState(false);
+  // Monotonic request id so stale on-chain responses don't overwrite a newer quote.
+  const quoteGen = useRef(0);
+  const pendingOnChain = useRef<{ gen: number; data: Partial<QuoteResult> } | null>(null);
   const [showGraph, setShowGraph] = useState(true);
   const [quoteError, setQuoteError] = useState<string | null>(null);
 
@@ -312,29 +318,40 @@ export default function RoutingLabPage() {
     const tokOut = tokenNodes[waypoints.at(-1)!];
     if (!tokIn || !tokOut) return;
     setQuoting(true); setQuoteError(null);
+    const gen = ++quoteGen.current;
+    pendingOnChain.current = null;
     try {
-      const baseBody: Record<string, unknown> = { token_in: tokIn, token_out: tokOut, amount_in: amountIn };
+      const baseBody: SwapRequest = { token_in: tokIn, token_out: tokOut, amount_in: amountIn };
       if (waypoints.length > 2) {
         baseBody.path = waypoints.map((sym) => tokenNodes[sym]).filter(Boolean);
         if (splitFractions !== null) baseBody.split_fractions_bps = splitFractions.map((p) => p * 100);
       }
-      const res = await fetch("/api/swap/quote", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(baseBody),
+      // Fire on-chain (slow, ~3s RPC) in parallel; merge when it arrives.
+      fetchQuoteOnChain(baseBody).then((data) => {
+        if (!data || gen !== quoteGen.current) return;
+        const patch = {
+          on_chain_amount_out: data.on_chain_amount_out,
+          on_chain_amount_out_human: data.on_chain_amount_out_human,
+          on_chain_quote_note: data.on_chain_quote_note,
+        };
+        setQuote((prev) => {
+          if (prev) return { ...prev, ...patch };
+          pendingOnChain.current = { gen, data: patch };
+          return prev;
+        });
       });
-      if (!res.ok) {
-        const text = await res.text().catch(() => res.statusText);
-        let detail = text;
-        try { detail = JSON.parse(text).detail ?? text; } catch { /* ignore */ }
-        throw new Error(detail);
-      }
-      setQuote(await res.json());
+
+      const offChain = (await apiFetchQuote(baseBody)) as unknown as QuoteResult;
+      if (gen !== quoteGen.current) return;
+      const stashed = pendingOnChain.current as { gen: number; data: Partial<QuoteResult> } | null;
+      setQuote(stashed && stashed.gen === gen ? { ...offChain, ...stashed.data } : offChain);
+      pendingOnChain.current = null;
     } catch (e: unknown) {
+      if (gen !== quoteGen.current) return;
       setQuote(null);
       setQuoteError(e instanceof Error ? e.message : String(e));
     } finally {
-      setQuoting(false);
+      if (gen === quoteGen.current) setQuoting(false);
     }
   }, [waypoints, amountIn, splitFractions, tokenNodes]);
 
@@ -580,6 +597,37 @@ export default function RoutingLabPage() {
                   </span>
                 )}
               </div>
+              {/* On-chain row (async; appears when /swap/quote/on-chain returns) */}
+              {(() => {
+                if (quote.on_chain_amount_out_human !== undefined) {
+                  const off = parseFloat(quote.amount_out_human);
+                  const on = parseFloat(quote.on_chain_amount_out_human);
+                  const diffPct = off > 0 ? ((on - off) / off) * 100 : 0;
+                  const abs = Math.abs(diffPct);
+                  const color = abs >= 3 ? "#f87171" : abs >= 0.5 ? "#fbbf24" : "#94a3b8";
+                  const sign = diffPct >= 0 ? "+" : "";
+                  const tip = quote.on_chain_quote_note
+                    || "On-chain eth_call via DeFiVM quote program (live pool state vs indexed reserves).";
+                  return (
+                    <div className="text-[10px] font-mono leading-tight px-3" title={tip} style={{ color }}>
+                      on-chain: {on.toPrecision(6)} {quote.token_out} ({sign}{diffPct.toFixed(2)}%)
+                    </div>
+                  );
+                }
+                if (quote.on_chain_quote_note) {
+                  return (
+                    <div className="text-[10px] text-muted leading-tight px-3" title={quote.on_chain_quote_note}>
+                      on-chain: unavailable
+                    </div>
+                  );
+                }
+                return (
+                  <div className="text-[10px] text-muted leading-tight px-3 flex items-center gap-1">
+                    <Loader size={10} className="animate-spin" />
+                    on-chain: …
+                  </div>
+                );
+              })()}
 
               {/* Route tree */}
               <div className="bg-[#0a0b0e] rounded-xl p-3">

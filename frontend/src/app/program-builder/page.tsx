@@ -22,7 +22,7 @@ import {
   ArrowDown,
   Terminal,
 } from "lucide-react";
-import { fetchPools } from "@/lib/api";
+import { fetchPools, fetchQuoteOnChain, fetchQuote, buildSwap } from "@/lib/api";
 import type { Pool } from "@/lib/types";
 
 // ── Block catalogue ───────────────────────────────────────────────────────────
@@ -114,6 +114,8 @@ interface QuoteState {
   price_impact?: string;
   dag?: RouteDAGData;
   error?: string;
+  on_chain_amount_out_human?: string;
+  on_chain_quote_note?: string;
 }
 
 interface CanvasBlock {
@@ -204,8 +206,7 @@ function assemblePseudo(
         const minOut = q?.amount_out_human
           ? ` → ~${parseFloat(q.amount_out_human).toPrecision(5)} ${c.token_out} (${c.slippage_bps ?? "50"} bps slippage)`
           : "";
-        const hasSplit = q?.dag?.actions.some((a) => a.type === "split");
-        lines.push(`; build_${hasSplit ? "execution_program_for_dag" : "hops_program"}(${hasSplit ? "dag" : "swap_route_to_hops(route, defi_vm, sender)"})`);
+        lines.push(`; build_swap_transaction(dag, amount_in, defi_vm, sender)`);
         lines.push(`SWAP  ${c.amount_in ?? "?"} ${c.token_in ?? "?"} → ${c.token_out ?? "?"}${minOut}`);
         if (q?.dag) {
           renderDagActions(q.dag.actions, lines, "        ");
@@ -361,6 +362,26 @@ function BlockConfigForm({
                       ({(parseFloat(quote.price_impact) * 100).toFixed(2)}% impact)
                     </span>
                   )}
+                </span>
+              )}
+              {quote?.on_chain_amount_out_human !== undefined && quote?.amount_out_human && !quote.loading && (() => {
+                const off = parseFloat(quote.amount_out_human);
+                const on = parseFloat(quote.on_chain_amount_out_human);
+                const diffPct = off > 0 ? ((on - off) / off) * 100 : 0;
+                const abs = Math.abs(diffPct);
+                const color = abs >= 3 ? "#f87171" : abs >= 0.5 ? "#fbbf24" : "#94a3b8";
+                const sign = diffPct >= 0 ? "+" : "";
+                const tip = quote.on_chain_quote_note
+                  || "On-chain eth_call via DeFiVM quote program (live pool state vs indexed reserves). Large divergence suggests stale index, V3 tick-crossing, or a bad route.";
+                return (
+                  <span className="text-[10px] font-mono leading-tight" style={{ color }} title={tip}>
+                    on-chain: {on.toPrecision(6)} {c.token_out} ({sign}{diffPct.toFixed(2)}%)
+                  </span>
+                );
+              })()}
+              {quote?.on_chain_quote_note && !quote.loading && quote?.on_chain_amount_out_human === undefined && (
+                <span className="text-[10px] text-muted leading-tight" title={quote.on_chain_quote_note}>
+                  on-chain: unavailable
                 </span>
               )}
             </div>
@@ -609,30 +630,33 @@ export default function ProgramBuilderPage() {
         if (!tokIn || !tokOut) return;
 
         setQuotes((q) => ({ ...q, [id]: { loading: true } }));
+        const quoteBodyObj = { token_in: tokIn, token_out: tokOut, amount_in };
+        // Fire off-chain (fast) and on-chain (slow) in parallel. Render the
+        // fast one immediately; patch in the on-chain amount when it arrives.
+        fetchQuoteOnChain(quoteBodyObj).then((data) => {
+          if (!data) return;
+          setQuotes((q) => ({
+            ...q,
+            [id]: {
+              ...(q[id] ?? { loading: true }),
+              on_chain_amount_out_human: data.on_chain_amount_out_human,
+              on_chain_quote_note: data.on_chain_quote_note,
+            },
+          }));
+        });
+
         try {
-          const res = await fetch("/api/swap/quote", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              token_in: tokIn,
-              token_out: tokOut,
-              amount_in,
-            }),
-          });
-          if (!res.ok) {
-            const text = await res.text().catch(() => res.statusText);
-            let detail = text;
-            try { detail = JSON.parse(text).detail ?? text; } catch { /* ignore */ }
-            throw new Error(detail);
-          }
-          const data = await res.json();
+          const data = await fetchQuote(quoteBodyObj);
           setQuotes((q) => ({
             ...q,
             [id]: {
               loading: false,
-              amount_out_human: data.amount_out_human,
-              price_impact: data.price_impact,
-              dag: data.dag,
+              amount_out_human: data.amount_out_human as string | undefined,
+              price_impact: data.price_impact as string | undefined,
+              dag: data.dag as RouteDAGData | undefined,
+              // Keep any on-chain values that already arrived.
+              on_chain_amount_out_human: q[id]?.on_chain_amount_out_human,
+              on_chain_quote_note: q[id]?.on_chain_quote_note,
             },
           }));
         } catch (e: unknown) {
@@ -691,23 +715,14 @@ export default function ProgramBuilderPage() {
     setRunning(true);
     setRunResult(null);
     try {
-      const res = await fetch("/api/swap/build", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          token_in: tokIn,
-          token_out: tokOut,
-          amount_in,
-          slippage_bps: slippage_bps ? parseInt(slippage_bps) : 50,
-          sender: sender.trim(),
-        }),
+      const data = await buildSwap({
+        token_in: tokIn,
+        token_out: tokOut,
+        amount_in,
+        slippage_bps: slippage_bps ? parseInt(slippage_bps) : 50,
+        sender: sender.trim(),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setRunResult({ ok: false, message: data.detail ?? res.statusText });
-      } else {
-        setRunResult({ ok: true, message: JSON.stringify(data, null, 2) });
-      }
+      setRunResult({ ok: true, message: JSON.stringify(data, null, 2) });
     } catch (e: unknown) {
       setRunResult({ ok: false, message: e instanceof Error ? e.message : String(e) });
     } finally {

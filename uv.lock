@@ -1351,7 +1351,7 @@ wheels = [
 [[package]]
 name = "pydefi"
 version = "0.1.0"
-source = { editable = "../pydefi" }
+source = { git = "https://github.com/mmsqe/pydefi.git?rev=main#ea8a253794930ec9f505aed1a7c7f477b279e78a" }
 dependencies = [
     { name = "aiohttp" },
     { name = "base58" },
@@ -1363,27 +1363,6 @@ dependencies = [
     { name = "sqlmodel" },
     { name = "web3" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9.0" },
-    { name = "alembic", marker = "extra == 'indexer'", specifier = ">=1.12.0" },
-    { name = "base58", specifier = ">=2.1.0" },
-    { name = "eth-abi", git = "https://github.com/yihuang/eth-abi.git?rev=copilot%2Fsupport-hooks-for-offset-detection" },
-    { name = "eth-contract", git = "https://github.com/yihuang/eth-contract.git?rev=main" },
-    { name = "ethereum-execution", marker = "extra == 'dev'", specifier = ">=2.19.0" },
-    { name = "msgpack", specifier = ">=1.0.0" },
-    { name = "py-solc-x", marker = "extra == 'dev'", specifier = ">=2.0.0" },
-    { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21" },
-    { name = "pytest-rerunfailures", marker = "extra == 'dev'", specifier = ">=14.0" },
-    { name = "requests", specifier = ">=2.31.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4.0" },
-    { name = "sqlmodel", specifier = ">=0.0.38" },
-    { name = "web3", specifier = ">=7.0.0" },
-]
-provides-extras = ["indexer", "dev"]
 
 [[package]]
 name = "pydefi-ui"
@@ -1405,7 +1384,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.111.0" },
-    { name = "pydefi", editable = "../pydefi" },
+    { name = "pydefi", git = "https://github.com/mmsqe/pydefi.git?rev=main" },
     { name = "sqlmodel", specifier = ">=0.0.18" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30.0" },
     { name = "web3", specifier = ">=7.0.0" },

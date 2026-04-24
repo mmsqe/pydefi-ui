@@ -21,8 +21,8 @@ from pydefi.indexer import Pool, V2SyncEvent, V3SwapEvent
 from pydefi.pathfinder.graph import PoolEdge, PoolGraph, V3PoolEdge
 from pydefi.pathfinder.router import Router
 from pydefi.types import ZERO_ADDRESS, Address, RouteDAG, RouteSplit, RouteSplitLeg, RouteSwap, Token, TokenAmount
-from pydefi.vm import Program, build_execution_program_for_dag, build_quote_program_for_dag
-from pydefi.vm.swap import build_swap_transaction
+from pydefi.vm import Program, build_execution_program_for_dag
+from pydefi.vm.swap import build_swap_transaction, quote_swap_transaction
 from sqlmodel import Session, select
 
 from backend.deps import get_indexer, get_rpc_url
@@ -47,6 +47,41 @@ def _get_v3_quoter(chain_id: int) -> str:
         return get_address("UNISWAP_V3_QUOTER", chain_id)
     except KeyError:
         return _V3_QUOTER_EXTRA.get(chain_id, "")
+
+
+async def _on_chain_quote_for_dag(dag: RouteDAG, amount_in_raw: int, chain_id: int) -> tuple[int | None, str]:
+    """Run the DeFiVM quote program via ``eth_call`` and return ``(amount_out, note)``.
+
+    Returns ``(None, reason)`` when RPC/quoter/vm isn't configured or the call
+    fails. ``note`` is an empty string on success. Off-chain and on-chain use
+    the same DAG, so the only difference is live vs indexed pool state.
+    """
+    vm_address = os.environ.get("DEFI_VM_ADDRESS", "").strip()
+    if not vm_address:
+        return None, "DEFI_VM_ADDRESS not set; on-chain cross-check unavailable"
+    rpc_url = get_rpc_url()
+    if not rpc_url:
+        return None, "RPC_URL not set; on-chain cross-check unavailable"
+    quoter_address = os.environ.get("V3_QUOTER_ADDRESS", "").strip() or _get_v3_quoter(chain_id)
+    if not quoter_address:
+        return None, f"no V3 quoter address for chain {chain_id}"
+
+    try:
+        from web3 import AsyncWeb3
+
+        w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
+        quoted = await quote_swap_transaction(
+            dag,
+            amount_in_raw,
+            vm_address,
+            w3,
+            quoter_address=Address(quoter_address),
+        )
+        amount_out = int(quoted.amount)
+        note = "on-chain quote is zero (no effective liquidity at current state)" if amount_out == 0 else ""
+        return amount_out, note
+    except Exception as exc:
+        return None, f"on-chain quote failed: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -317,21 +352,17 @@ async def _augment_graph_on_demand(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/swap/quote")
-async def get_quote(body: dict) -> dict:
-    """Compute an off-chain swap quote using the pydefi Router.
+async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int, int, str]:
+    """Route *body* to a DAG and compute amounts. Shared by /quote and /quote/on-chain.
 
-    Request body keys:
-      - ``token_in``  / ``token_out``: ``{address, symbol, decimals, chain_id}``
-      - ``amount_in``: human-readable string, e.g. ``"0.1"``
-      - ``is_native_in`` / ``is_native_out``: bool (default ``false``)
+    Returns ``(dag, tok_in, tok_out, amount_in_raw, amount_out_raw, price_impact_str)``.
+    Raises ``HTTPException`` on invalid input or unroutable pair.
     """
     tok_in = _token_from_body(body.get("token_in") or {})
     tok_out = _token_from_body(body.get("token_out") or {})
     amount_in_str = str(body.get("amount_in", ""))
     _path_raw = body.get("path")
 
-    # Allow round-trips (same start/end token) only when intermediate hops are provided
     if tok_in.address == tok_out.address and not (isinstance(_path_raw, list) and len(_path_raw) > 2):
         raise HTTPException(status_code=422, detail="token_in and token_out must be different.")
 
@@ -349,11 +380,8 @@ async def get_quote(body: dict) -> dict:
             raise HTTPException(status_code=422, detail="No indexed pools found. Run a backfill first.")
         graph = _build_graph(session, list(pools))
 
-    # ── Custom path: explicit hop-by-hop route ───────────────────────────────
     if isinstance(_path_raw, list) and len(_path_raw) > 2:
         path_tokens = [_token_from_body(t) for t in _path_raw]
-        # Optional manual split fractions: list of fraction_bps per leg, must sum to 10000.
-        # e.g. [5000, 5000] for 50/50, [3000, 3000, 4000] for a 3-way split.
         _split_fracs_raw = body.get("split_fractions_bps")
         manual_fractions: list[int] | None = None
         if _split_fracs_raw is not None:
@@ -368,17 +396,11 @@ async def get_quote(body: dict) -> dict:
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=422, detail=f"split_fractions_bps invalid: {exc}")
 
-        # Use a max_hops=1 router per waypoint pair so each hop is confined to
-        # direct pools only but can still be split across multiple pools when
-        # find_best_split finds it beneficial (e.g. two UNI/USDC V3 pools).
         hop_router = Router(graph, max_hops=1)
         combined_actions: list = []
         cur_amount = amount_in_raw
         for i in range(len(path_tokens) - 1):
             t_in_h, t_out_h = path_tokens[i], path_tokens[i + 1]
-
-            # When manual split fractions are requested, pick the top N direct pools
-            # (N = number of requested legs) and build an N-leg RouteSplit.
             if manual_fractions is not None:
                 n_req = len(manual_fractions)
                 candidates = sorted(
@@ -388,7 +410,6 @@ async def get_quote(body: dict) -> dict:
                 )[:n_req]
                 n = len(candidates)
                 if n >= 2:
-                    # Renormalize fractions to the pools actually available
                     raw_fracs = manual_fractions[:n]
                     total = sum(raw_fracs)
                     fracs = [f * 10000 // total for f in raw_fracs[:-1]]
@@ -415,29 +436,21 @@ async def get_quote(body: dict) -> dict:
             except (NoRouteFoundError, ValueError) as exc:
                 raise HTTPException(
                     status_code=422,
-                    detail=str(exc) if isinstance(exc, ValueError) else f"No indexed pool for {t_in_h.symbol} → {t_out_h.symbol} on chain {t_in_h.chain_id}.",
+                    detail=str(exc)
+                    if isinstance(exc, ValueError)
+                    else f"No indexed pool for {t_in_h.symbol} → {t_out_h.symbol} on chain {t_in_h.chain_id}.",
                 )
             cur_amount = hop_router.simulate(hop_dag, cur_amount)
             combined_actions.extend(hop_dag.actions)
-        dag_path = RouteDAG().from_token(path_tokens[0])
-        dag_path.actions.extend(combined_actions)
-        amount_out_human = str(Decimal(cur_amount) / Decimal(10 ** path_tokens[-1].decimals))
-        return {
-            "amount_out": str(cur_amount),
-            "amount_out_human": amount_out_human,
-            "price_impact": "NaN",
-            "token_in": path_tokens[0].symbol,
-            "token_out": path_tokens[-1].symbol,
-            "dag": _serialize_dag(dag_path),
-        }
+        dag = RouteDAG().from_token(path_tokens[0])
+        dag.actions.extend(combined_actions)
+        return dag, path_tokens[0], path_tokens[-1], amount_in_raw, cur_amount, "NaN"
 
     router_obj = Router(graph)
     try:
         route = router_obj.find_best_route(TokenAmount(tok_in, amount_in_raw), tok_out)
         dag = router_obj.find_best_split(TokenAmount(tok_in, amount_in_raw), tok_out)
     except NoRouteFoundError:
-        # No indexed pool for this pair — try on-demand factory discovery if
-        # RPC_URL is configured, then retry routing once.
         rpc_url = get_rpc_url()
         if not rpc_url:
             raise HTTPException(
@@ -462,21 +475,24 @@ async def get_quote(body: dict) -> dict:
             )
 
     amount_out_raw = route.amount_out.amount
-    quote = AggregatorQuote(
-        token_in=tok_in,
-        token_out=tok_out,
-        amount_in=TokenAmount(tok_in, amount_in_raw),
-        amount_out=route.amount_out,
-        min_amount_out=TokenAmount(tok_out, 0),
-        gas_estimate=0,
-        price_impact=route.price_impact,
-        protocol="pydefi-router",
-        route_summary=f"{tok_in.symbol} → {tok_out.symbol}",
-    )
+    price_impact_str = "NaN" if route.price_impact.is_nan() else str(route.price_impact.quantize(Decimal("0.000001")))
+    return dag, tok_in, tok_out, amount_in_raw, amount_out_raw, price_impact_str
 
+
+@router.post("/swap/quote")
+async def get_quote(body: dict) -> dict:
+    """Compute an off-chain swap quote using the pydefi Router.
+
+    Request body keys:
+      - ``token_in``  / ``token_out``: ``{address, symbol, decimals, chain_id}``
+      - ``amount_in``: human-readable string, e.g. ``"0.1"``
+      - ``is_native_in`` / ``is_native_out``: bool (default ``false``)
+
+    Fast path — no RPC. For live on-chain cross-check, POST the same body to
+    :func:`quote_on_chain` (``/swap/quote/on-chain``) in parallel.
+    """
+    dag, tok_in, tok_out, _, amount_out_raw, price_impact_str = await _build_dag_from_body(body)
     amount_out_human = str(Decimal(amount_out_raw) / Decimal(10**tok_out.decimals))
-    price_impact_str = "NaN" if quote.price_impact.is_nan() else str(quote.price_impact.quantize(Decimal("0.000001")))
-
     return {
         "amount_out": str(amount_out_raw),
         "amount_out_human": amount_out_human,
@@ -485,6 +501,25 @@ async def get_quote(body: dict) -> dict:
         "token_out": tok_out.symbol,
         "dag": _serialize_dag(dag),
     }
+
+
+@router.post("/swap/quote/on-chain")
+async def get_quote_on_chain(body: dict) -> dict:
+    """Run the DeFiVM on-chain cross-check for the same route as ``/swap/quote``.
+
+    Issues one ``eth_call`` to the DeFiVM contract; returns only the on-chain
+    fields. Separated from ``/swap/quote`` so the UI can fetch it in parallel
+    without blocking the fast off-chain quote.
+    """
+    dag, _, tok_out, amount_in_raw, _, _ = await _build_dag_from_body(body)
+    on_chain_raw, on_chain_note = await _on_chain_quote_for_dag(dag, amount_in_raw, tok_out.chain_id)
+    result: dict = {"token_out": tok_out.symbol}
+    if on_chain_raw is not None:
+        result["on_chain_amount_out"] = str(on_chain_raw)
+        result["on_chain_amount_out_human"] = str(Decimal(on_chain_raw) / Decimal(10**tok_out.decimals))
+    if on_chain_note:
+        result["on_chain_quote_note"] = on_chain_note
+    return result
 
 
 @router.post("/swap/build")
@@ -552,34 +587,12 @@ async def build_swap(body: dict) -> dict:
     except NoRouteFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    rpc_url = get_rpc_url()
-    on_chain_quote_used = False
-    on_chain_quote_note: str = ""
-    amount_out_for_slippage: int = route.amount_out.amount
-
-    # ── On-chain quote via DeFiVM eth_call (V2 + V3 routes) ─────────────────────
-    # build_quote_program_for_dag composes a view-only DeFiVM program that:
-    #   V2 hops — pair.getReserves() + constant-product formula (live reserves)
-    #   V3 hops — quoter.quoteExactInput per hop
-    if rpc_url:
-        quoter_address = os.environ.get("V3_QUOTER_ADDRESS", "").strip() or _get_v3_quoter(tok_in.chain_id)
-        if quoter_address:
-            try:
-                from web3 import AsyncWeb3
-
-                w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
-                quote_prog = build_quote_program_for_dag(dag, amount_in=amount_in_raw, quoter_address=quoter_address)
-                returndata = await w3.eth.call({"to": vm_address, "data": bytes(quote_prog)})
-                amount_out = int.from_bytes(returndata[:32], "big")
-                if amount_out > 0:
-                    amount_out_for_slippage = amount_out
-                    on_chain_quote_used = True
-            except Exception as exc:
-                on_chain_quote_note = f"on-chain quote failed ({exc}); using indexed estimate"
-        else:
-            on_chain_quote_note = "no V3 quoter address for this chain; using indexed estimate"
-    else:
-        on_chain_quote_note = "RPC_URL not set; using indexed estimate (set RPC_URL for accurate slippage)"
+    on_chain_raw, on_chain_quote_note = await _on_chain_quote_for_dag(dag, amount_in_raw, tok_in.chain_id)
+    # Use on-chain quote when available and non-zero; a zero on-chain quote is a
+    # real "no liquidity" signal but useless as a slippage floor, so fall back to
+    # the off-chain estimate and keep the note so the caller can see the divergence.
+    on_chain_quote_used = on_chain_raw is not None and on_chain_raw > 0
+    amount_out_for_slippage: int = on_chain_raw if on_chain_quote_used else route.amount_out.amount
 
     min_final_out = amount_out_for_slippage * (10_000 - slippage_bps) // 10_000
 

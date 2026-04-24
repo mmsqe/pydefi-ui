@@ -8,7 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
     "sqlmodel>=0.0.18",
     "web3>=7.0.0",
-    "pydefi>=0.0.2",
+    "pydefi @ git+https://github.com/mmsqe/pydefi.git@main",
 ]
 
 [dependency-groups]
@@ -23,6 +23,3 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 ignore = ["E501", "E402"]
-
-[tool.uv.sources]
-pydefi = { path = "../pydefi", editable = true }

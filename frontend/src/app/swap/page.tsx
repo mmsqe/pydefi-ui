@@ -13,7 +13,7 @@ import { erc20Abi, formatUnits, parseEther } from "viem";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { swrFetcher } from "@/lib/api";
+import { swrFetcher, fetchQuoteOnChain } from "@/lib/api";
 import { formatNumber } from "@/lib/utils";
 import type { Pool } from "@/lib/types";
 import {
@@ -53,6 +53,8 @@ export default function SwapPage() {
   const [priceImpact, setPriceImpact] = useState<string | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
   const [quoteError, setQuoteError] = useState<string | null>(null);
+  const [onChainQuote, setOnChainQuote] = useState<string | null>(null);
+  const [onChainNote, setOnChainNote] = useState<string | null>(null);
 
   const { address, chain } = useAccount();
   const { data: pools } = useSWR<Pool[]>(`${BASE}/api/pools`, swrFetcher);
@@ -159,16 +161,25 @@ export default function SwapPage() {
 
       setQuoteLoading(true);
       setQuoteError(null);
+      setOnChainQuote(null);
+      setOnChainNote(null);
+      const body = {
+        token_in: tokenInRef,
+        token_out: tokenOutRef,
+        amount_in: amount,
+        is_native_in: nativeIn,
+      };
+      // Fire on-chain (slow, ~3s) in parallel; merge when it arrives.
+      fetchQuoteOnChain(body).then((data) => {
+        if (!data) return;
+        if (data.on_chain_amount_out_human !== undefined) setOnChainQuote(data.on_chain_amount_out_human);
+        if (data.on_chain_quote_note) setOnChainNote(data.on_chain_quote_note);
+      });
       try {
         const res = await fetch(`${BASE}/api/swap/quote`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            token_in: tokenInRef,
-            token_out: tokenOutRef,
-            amount_in: amount,
-            is_native_in: nativeIn,
-          }),
+          body: JSON.stringify(body),
         });
         if (!res.ok) {
           const detail = await res.json().then((j) => j.detail ?? JSON.stringify(j)).catch(() => res.statusText);
@@ -201,6 +212,8 @@ export default function SwapPage() {
       setQuoteDag(null);
       setPriceImpact(null);
       setQuoteError(null);
+      setOnChainQuote(null);
+      setOnChainNote(null);
       return;
     }
     const timer = setTimeout(
@@ -387,6 +400,37 @@ export default function SwapPage() {
                 <ChevronDown size={12} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted pointer-events-none" />
               </div>
             </div>
+            {/* On-chain cross-check (async; appears when /swap/quote/on-chain returns) */}
+            {quoteResult && !quoteLoading && (() => {
+              if (onChainQuote !== null) {
+                const off = parseFloat(quoteResult);
+                const on = parseFloat(onChainQuote);
+                const diffPct = off > 0 ? ((on - off) / off) * 100 : 0;
+                const abs = Math.abs(diffPct);
+                const color = abs >= 3 ? "#f87171" : abs >= 0.5 ? "#fbbf24" : "#94a3b8";
+                const sign = diffPct >= 0 ? "+" : "";
+                const tip = onChainNote
+                  || "On-chain eth_call via DeFiVM quote program (live pool state vs indexed reserves).";
+                return (
+                  <div className="text-[10px] font-mono leading-tight mt-1" style={{ color }} title={tip}>
+                    on-chain: {on.toPrecision(6)} {tokenOut} ({sign}{diffPct.toFixed(2)}%)
+                  </div>
+                );
+              }
+              if (onChainNote) {
+                return (
+                  <div className="text-[10px] text-muted leading-tight mt-1" title={onChainNote}>
+                    on-chain: unavailable
+                  </div>
+                );
+              }
+              return (
+                <div className="text-[10px] text-muted leading-tight mt-1 flex items-center gap-1">
+                  <Loader size={10} className="animate-spin" />
+                  on-chain: …
+                </div>
+              );
+            })()}
           </div>
 
           {/* Quote / balance error */}

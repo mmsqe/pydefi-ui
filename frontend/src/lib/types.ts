@@ -76,6 +76,9 @@ export interface SwapRequest {
   token_out: TokenRef;
   amount_in: string;     // human-readable, e.g. "0.1"
   is_native_in?: boolean;
+  // multi-hop routing (routing-lab): explicit waypoints + optional split fractions
+  path?: TokenRef[];
+  split_fractions_bps?: number[];
   // build-only fields
   slippage_bps?: number;
   sender?: string;

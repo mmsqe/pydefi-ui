@@ -104,6 +104,25 @@ export async function fetchQuote(body: SwapRequest): Promise<Record<string, unkn
   });
 }
 
+export interface QuoteOnChainResponse {
+  token_out: string;
+  on_chain_amount_out?: string;
+  on_chain_amount_out_human?: string;
+  on_chain_quote_note?: string;
+}
+
+/** Slow (~3s) on-chain DeFiVM cross-check. Best-effort: returns null on error. */
+export async function fetchQuoteOnChain(body: SwapRequest): Promise<QuoteOnChainResponse | null> {
+  try {
+    return await apiFetch<QuoteOnChainResponse>("/api/swap/quote/on-chain", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return null;
+  }
+}
+
 export async function buildSwap(body: SwapRequest): Promise<Record<string, unknown>> {
   return apiFetch<Record<string, unknown>>("/api/swap/build", {
     method: "POST",

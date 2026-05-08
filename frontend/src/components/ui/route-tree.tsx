@@ -36,6 +36,11 @@ export interface RouteDAGData { token_in: string; actions: DAGAction[]; }
 
 export interface VisualHop {
   token_in: string; token_out: string; protocol: string; fee_bps: number; pool_address: string;
+  // When the DAG nests a RouteSplit *inside* a leg (multi-edge bundle —
+  // ASGM's per-hop ``w_e``), we collapse it to a single VisualHop whose
+  // top-level fields point at the highest-weight parallel pool, with the
+  // remaining parallel pools captured here for compact rendering.
+  bundle?: { protocol: string; fee_bps: number; pool_address: string; fraction_bps: number }[];
 }
 export interface VisualLane { fraction_bps: number; hops: VisualHop[]; }
 
@@ -91,6 +96,28 @@ function buildSections(actions: DAGAction[], tokenIn: string): VisualSection[] {
             if (la.type === "swap") {
               hops.push({ token_in: lc, token_out: la.token_out, protocol: la.protocol, fee_bps: la.fee_bps, pool_address: la.pool_address });
               lc = la.token_out;
+            } else if (la.type === "split") {
+              // Nested RouteSplit inside a leg: ASGM emits a multi-edge
+              // bundle (parallel pools at the same hop) as a Split. Collapse
+              // it to a single VisualHop whose top-level fields are the
+              // highest-weight pool and whose `bundle` carries the rest.
+              const sortedLegs = [...la.legs].sort((x, y) => y.fraction_bps - x.fraction_bps);
+              const head = sortedLegs[0];
+              const headSwap = head.actions.find((x): x is DAGSwap => x.type === "swap");
+              if (!headSwap) continue;
+              const bundle = sortedLegs.slice(1)
+                .map((alt) => alt.actions.find((x): x is DAGSwap => x.type === "swap"))
+                .filter((s): s is DAGSwap => s !== undefined)
+                .map((s, k) => ({
+                  protocol: s.protocol, fee_bps: s.fee_bps, pool_address: s.pool_address,
+                  fraction_bps: sortedLegs[k + 1].fraction_bps,
+                }));
+              hops.push({
+                token_in: lc, token_out: la.token_out,
+                protocol: headSwap.protocol, fee_bps: headSwap.fee_bps, pool_address: headSwap.pool_address,
+                bundle: bundle.length > 0 ? bundle : undefined,
+              });
+              lc = la.token_out;
             }
           }
           return { fraction_bps: leg.fraction_bps, hops };
@@ -106,6 +133,18 @@ function buildSections(actions: DAGAction[], tokenIn: string): VisualSection[] {
 // ── RouteTree SVG ─────────────────────────────────────────────────────────────
 
 const BASE = { W: 700, NODE_R: 26, INT_R: 19, LANE_H: 84, PAD_Y: 22, PAD_X: 44 };
+
+// Font sizes (multiplied by `sc` at render time). Tuned to fit the densest
+// case: a leg containing nested multi-edge bundles where badges and bundle
+// extras compete for the same segW.
+const FONT = {
+  HOP_TOP: 8,        // pool fee tier (e.g. "V3 0.05%")
+  HOP_BOT: 6.5,      // pool address suffix
+  HOP_BUNDLE: 6,     // extra fee tiers when a hop is a multi-edge bundle
+  PCT_PILL: 10.5,    // outer split leg fraction (e.g. "64%")
+  TOKEN_LARGE: 9,    // intermediate token symbol (≤ 4 chars)
+  TOKEN_SMALL: 7,    // intermediate token symbol (> 4 chars)
+};
 
 export function RouteTree({
   dag,
@@ -178,8 +217,8 @@ export function RouteTree({
 
   // Scaled helpers so badge geometry, fonts, and offsets grow with `large`
   const hopBadge = (topLbl: string, botLbl: string) => {
-    const bw = Math.max(topLbl.length * 6.4 * sc + 14 * sc, botLbl.length * 5.4 * sc + 14 * sc);
-    const bh = botLbl ? 34 * sc : 20 * sc;
+    const bw = Math.max(topLbl.length * 5.4 * sc + 12 * sc, botLbl.length * 4.6 * sc + 12 * sc);
+    const bh = botLbl ? 30 * sc : 18 * sc;
     return { bw, bh };
   };
 
@@ -211,11 +250,17 @@ export function RouteTree({
                     <line x1={hx1} y1={cy} x2={xm - bw / 2 - 3} y2={cy} stroke={pc} strokeWidth="1.5" strokeOpacity="0.75" />
                     <rect x={xm - bw / 2} y={cy - bh / 2} width={bw} height={bh} rx={bh / 2}
                       fill="#0d1117" stroke={pc} strokeWidth="1.2" strokeOpacity="0.85" />
-                    <text x={xm} y={cy - (botLbl ? 4 * sc : -4 * sc)} textAnchor="middle" fontSize={9.5 * sc}
+                    <text x={xm} y={cy - (botLbl ? 3 * sc : -4 * sc)} textAnchor="middle" fontSize={FONT.HOP_TOP * sc}
                       fontFamily="monospace" fontWeight="600" fill={pc} style={{ pointerEvents: "none" }}>{topLbl}</text>
                     {botLbl && (
-                      <text x={xm} y={cy + 11 * sc} textAnchor="middle" fontSize={7.5 * sc}
+                      <text x={xm} y={cy + 10 * sc} textAnchor="middle" fontSize={FONT.HOP_BOT * sc}
                         fontFamily="monospace" fill={`${pc}80`} style={{ pointerEvents: "none" }}>{botLbl}</text>
+                    )}
+                    {hop.bundle && hop.bundle.length > 0 && (
+                      <text x={xm} y={cy + bh / 2 + 9 * sc} textAnchor="middle" fontSize={FONT.HOP_BUNDLE * sc}
+                        fontFamily="monospace" fill={`${pc}b0`} style={{ pointerEvents: "none" }}>
+                        +{hop.bundle.map((b) => `${protocolShort(b.protocol)} ${b.fee_bps % 100 === 0 ? `${b.fee_bps / 100}%` : `${(b.fee_bps / 100).toFixed(2)}%`}`).join(", ")}
+                      </text>
                     )}
                     <line x1={xm + bw / 2 + 3} y1={cy} x2={hx2} y2={cy} stroke={pc} strokeWidth="1.5" strokeOpacity="0.75" />
                   </g>
@@ -266,7 +311,7 @@ export function RouteTree({
                         fill={isSel ? "#00d4ff18" : "#ffffff08"}
                         stroke={isSel ? "#00d4ff" : "#4b5570"} strokeWidth="1" strokeOpacity={isSel ? 0.9 : 0.6} />
                       <text x={x1 + 2 + pillW / 2} y={y + 4.5 * sc} textAnchor="middle"
-                        fontSize={10.5 * sc} fontWeight="700" fontFamily="monospace"
+                        fontSize={FONT.PCT_PILL * sc} fontWeight="700" fontFamily="monospace"
                         fill={isSel ? "#00d4ff" : "#94a3b8"} style={{ pointerEvents: "none" }}>{pct}%</text>
                     </g>
                   )}
@@ -286,7 +331,7 @@ export function RouteTree({
                               fill={`${tokenColor(hop.token_in)}20`}
                               stroke={tokenColor(hop.token_in)} strokeWidth="1.5" strokeOpacity="0.9" />
                             <text x={lx1 + j * segW} y={y + 4 * sc} textAnchor="middle"
-                              fontSize={hop.token_in.length > 4 ? 7 * sc : 9 * sc} fontWeight="bold"
+                              fontSize={(hop.token_in.length > 4 ? FONT.TOKEN_SMALL : FONT.TOKEN_LARGE) * sc} fontWeight="bold"
                               fontFamily="monospace" fill={tokenColor(hop.token_in)}
                               style={{ pointerEvents: "none" }}>{hop.token_in}</text>
                           </>
@@ -295,13 +340,19 @@ export function RouteTree({
                           stroke={pc} strokeWidth="1.5" strokeOpacity="0.75" />
                         <rect x={xm - bw / 2} y={y - bh / 2} width={bw} height={bh} rx={bh / 2}
                           fill="#0d1117" stroke={pc} strokeWidth="1.2" strokeOpacity="0.85" />
-                        <text x={xm} y={y - (botLbl ? 4 * sc : -4 * sc)} textAnchor="middle" fontSize={9.5 * sc}
+                        <text x={xm} y={y - (botLbl ? 3 * sc : -4 * sc)} textAnchor="middle" fontSize={FONT.HOP_TOP * sc}
                           fontFamily="monospace" fontWeight="600" fill={pc}
                           style={{ pointerEvents: "none" }}>{topLbl}</text>
                         {botLbl && (
-                          <text x={xm} y={y + 11 * sc} textAnchor="middle" fontSize={7.5 * sc}
+                          <text x={xm} y={y + 10 * sc} textAnchor="middle" fontSize={FONT.HOP_BOT * sc}
                             fontFamily="monospace" fill={`${pc}80`}
                             style={{ pointerEvents: "none" }}>{botLbl}</text>
+                        )}
+                        {hop.bundle && hop.bundle.length > 0 && (
+                          <text x={xm} y={y + bh / 2 + 9 * sc} textAnchor="middle" fontSize={FONT.HOP_BUNDLE * sc}
+                            fontFamily="monospace" fill={`${pc}b0`} style={{ pointerEvents: "none" }}>
+                            +{hop.bundle.map((b) => `${protocolShort(b.protocol)} ${b.fee_bps % 100 === 0 ? `${b.fee_bps / 100}%` : `${(b.fee_bps / 100).toFixed(2)}%`}`).join(", ")}
+                          </text>
                         )}
                         <line x1={xm + bw / 2 + 3} y1={y} x2={hx2} y2={y}
                           stroke={pc} strokeWidth="1.5" strokeOpacity="0.75" />

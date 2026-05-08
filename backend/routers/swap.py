@@ -78,7 +78,7 @@ async def _on_chain_quote_for_dag(dag: RouteDAG, amount_in_raw: int, chain_id: i
             quoter_address=Address(quoter_address),
         )
         note = "on-chain quote is zero (no effective liquidity at current state)" if amount_out == 0 else ""
-        return amount_out, note
+        return int(amount_out), note
     except Exception as exc:
         return None, f"on-chain quote failed: {exc}"
 
@@ -431,7 +431,9 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
                     continue
 
             try:
-                hop_dag = hop_router.find_best_split(TokenAmount(t_in_h, cur_amount), t_out_h)
+                hop_dag = hop_router.find_optimal_split(TokenAmount(t_in_h, cur_amount), t_out_h)
+                cur_amount = hop_router.simulate(hop_dag, cur_amount)
+                combined_actions.extend(hop_dag.actions)
             except (NoRouteFoundError, ValueError) as exc:
                 raise HTTPException(
                     status_code=422,
@@ -439,16 +441,24 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
                     if isinstance(exc, ValueError)
                     else f"No indexed pool for {t_in_h.symbol} → {t_out_h.symbol} on chain {t_in_h.chain_id}.",
                 )
-            cur_amount = hop_router.simulate(hop_dag, cur_amount)
-            combined_actions.extend(hop_dag.actions)
         dag = RouteDAG().from_token(path_tokens[0])
         dag.actions.extend(combined_actions)
         return dag, path_tokens[0], path_tokens[-1], amount_in_raw, cur_amount, "NaN"
 
+    def _route_and_dag(r: Router) -> tuple[int, RouteDAG, str]:
+        ta = TokenAmount(tok_in, amount_in_raw)
+        route_local = r.find_best_route(ta, tok_out)
+        chosen_dag = r.find_optimal_split(ta, tok_out)
+        # Multi-edge bundle output can exceed the best single-route amount.
+        out_raw = r.simulate(chosen_dag, amount_in_raw) or route_local.amount_out.amount
+        impact = (
+            "NaN" if route_local.price_impact.is_nan() else str(route_local.price_impact.quantize(Decimal("0.000001")))
+        )
+        return out_raw, chosen_dag, impact
+
     router_obj = Router(graph)
     try:
-        route = router_obj.find_best_route(TokenAmount(tok_in, amount_in_raw), tok_out)
-        dag = router_obj.find_best_split(TokenAmount(tok_in, amount_in_raw), tok_out)
+        amount_out_raw, dag, price_impact_str = _route_and_dag(router_obj)
     except NoRouteFoundError:
         rpc_url = get_rpc_url()
         if not rpc_url:
@@ -462,8 +472,7 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
         graph = await _augment_graph_on_demand(graph, tok_in, tok_out, rpc_url)
         router_obj = Router(graph)
         try:
-            route = router_obj.find_best_route(TokenAmount(tok_in, amount_in_raw), tok_out)
-            dag = router_obj.find_best_split(TokenAmount(tok_in, amount_in_raw), tok_out)
+            amount_out_raw, dag, price_impact_str = _route_and_dag(router_obj)
         except NoRouteFoundError:
             raise HTTPException(
                 status_code=422,
@@ -473,8 +482,6 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
                 ),
             )
 
-    amount_out_raw = route.amount_out.amount
-    price_impact_str = "NaN" if route.price_impact.is_nan() else str(route.price_impact.quantize(Decimal("0.000001")))
     return dag, tok_in, tok_out, amount_in_raw, amount_out_raw, price_impact_str
 
 

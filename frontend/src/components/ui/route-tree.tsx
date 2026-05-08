@@ -371,12 +371,18 @@ export function RouteTree({
         );
       })}
 
-      {/* Token nodes */}
+      {/* Token nodes — terminals use the same input=green / output=cyan
+          convention as PoolGraphSVG so the same token doesn't appear in
+          two different colours across the two panels. Intermediates keep
+          their per-symbol hash colour so users can trace specific tokens
+          through the DAG. */}
       {nodeSyms.map((sym, i) => {
         const cx = nodeCx[i];
         const r = nodeR(i);
-        const color = tokenColor(sym);
-        const isTerminal = i === 0 || i === nodeSyms.length - 1;
+        const isInput = i === 0;
+        const isOutput = i === nodeSyms.length - 1;
+        const isTerminal = isInput || isOutput;
+        const color = isInput ? "#00ff87" : isOutput ? "#00d4ff" : tokenColor(sym);
         return (
           <g key={i}>
             {isTerminal && (

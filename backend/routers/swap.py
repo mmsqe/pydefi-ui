@@ -151,6 +151,22 @@ async def _on_chain_quote_for_dag(dag: RouteDAG, amount_in_raw: int, chain_id: i
 # ---------------------------------------------------------------------------
 
 
+def _dag_swap_count(actions) -> int:
+    """Max number of sequential swaps along any path through *actions*.
+
+    1 for single-hop (one swap, or a split of single swaps); > 1 for
+    multi-hop. Used to assert single-hop DAGs in the waypoint dispatch
+    loop where solver hop-cap behaviour can otherwise diverge.
+    """
+    total = 0
+    for a in actions:
+        if isinstance(a, RouteSwap):
+            total += 1
+        elif isinstance(a, RouteSplit):
+            total += max((_dag_swap_count(leg.actions) for leg in a.legs), default=0)
+    return total
+
+
 def _token_from_body(data: dict) -> Token:
     """Build a pydefi :class:`~pydefi.types.Token` from a request token dict.
 
@@ -443,6 +459,15 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
     if solver_raw not in ("hop_dp", "hermes"):
         raise HTTPException(status_code=422, detail=f"solver must be 'hop_dp' or 'hermes', got {solver_raw!r}")
 
+    # Hop cap for non-waypoint full-route flow; capped at 5 (beyond that, hop_dp
+    # is slower than just using candidate_solver="hermes" which has no cap).
+    try:
+        max_hops = int(body.get("max_hops", 3))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="max_hops must be an integer")
+    if not 1 <= max_hops <= 5:
+        raise HTTPException(status_code=422, detail="max_hops must be between 1 and 5")
+
     indexer = get_indexer()
     with Session(indexer._engine) as session:
         pools = session.exec(select(Pool)).all()
@@ -466,7 +491,14 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=422, detail=f"split_fractions_bps invalid: {exc}")
 
-        hop_router = _make_router(graph, hermes_cached, solver_raw, max_hops=1)
+        # Waypoint segments are single-hop by the user's explicit intent
+        # (they specified each token in the path). Hermes' candidate solver
+        # ignores max_hops and returns multi-hop alternatives even when
+        # direct pools exist — those leak through ASGM into the per-segment
+        # DAG and break the strict-hop semantics. Force hop_dp here so both
+        # solver choices give the same per-segment behaviour. The user's
+        # solver_raw still applies on the non-waypoint full-route flow.
+        hop_router = _make_router(graph, hermes_cached, "hop_dp", max_hops=1)
         combined_actions: list = []
         cur_amount = amount_in_raw
         for i in range(len(path_tokens) - 1):
@@ -503,8 +535,6 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
 
             try:
                 hop_dag = hop_router.find_optimal_split(TokenAmount(t_in_h, cur_amount), t_out_h)
-                cur_amount = hop_router.simulate(hop_dag, cur_amount)
-                combined_actions.extend(hop_dag.actions)
             except (NoRouteFoundError, ValueError) as exc:
                 raise HTTPException(
                     status_code=422,
@@ -512,6 +542,16 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
                     if isinstance(exc, ValueError)
                     else f"No indexed pool for {t_in_h.symbol} → {t_out_h.symbol} on chain {t_in_h.chain_id}.",
                 )
+            # Hermes' candidate solver ignores max_hops; verify the returned
+            # DAG is a single-hop path so the waypoint contract holds for
+            # both solvers.
+            if _dag_swap_count(hop_dag.actions) > 1:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"No indexed pool for {t_in_h.symbol} → {t_out_h.symbol} on chain {t_in_h.chain_id}.",
+                )
+            cur_amount = hop_router.simulate(hop_dag, cur_amount)
+            combined_actions.extend(hop_dag.actions)
         dag = RouteDAG().from_token(path_tokens[0])
         dag.actions.extend(combined_actions)
         return dag, path_tokens[0], path_tokens[-1], amount_in_raw, cur_amount, "NaN"
@@ -527,7 +567,7 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
         )
         return out_raw, chosen_dag, impact
 
-    router_obj = _make_router(graph, hermes_cached, solver_raw)
+    router_obj = _make_router(graph, hermes_cached, solver_raw, max_hops=max_hops)
     try:
         amount_out_raw, dag, price_impact_str = _route_and_dag(router_obj)
     except NoRouteFoundError:
@@ -542,7 +582,7 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
             )
         graph = await _augment_graph_on_demand(graph, tok_in, tok_out, rpc_url)
         # Augmented graph differs from cached one — fresh Router (no cache hit).
-        router_obj = Router(graph, candidate_solver=solver_raw)
+        router_obj = Router(graph, max_hops=max_hops, candidate_solver=solver_raw)
         try:
             amount_out_raw, dag, price_impact_str = _route_and_dag(router_obj)
         except NoRouteFoundError:

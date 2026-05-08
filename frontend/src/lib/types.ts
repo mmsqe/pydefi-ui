@@ -83,6 +83,9 @@ export interface SwapRequest {
   // "hermes" is the treewidth-parameterized SSSP (no hop cap, finds long-tail
   // routes the DP misses, slower per query at small graph sizes).
   solver?: "hop_dp" | "hermes";
+  // hop cap for the hop_dp solver on the non-waypoint full-route flow
+  // (default 3, range 1–5). Beyond 5, switch to solver=hermes.
+  max_hops?: number;
   // build-only fields
   slippage_bps?: number;
   sender?: string;

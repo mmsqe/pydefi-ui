@@ -22,7 +22,7 @@ from pydefi.pathfinder.graph import PoolEdge, PoolGraph, V3PoolEdge
 from pydefi.pathfinder.router import Router
 from pydefi.types import ZERO_ADDRESS, Address, RouteDAG, RouteSplit, RouteSplitLeg, RouteSwap, Token, TokenAmount
 from pydefi.vm import Program, build_execution_program_for_dag
-from pydefi.vm.swap import build_swap_transaction, quote_swap_transaction
+from pydefi.vm.swap import build_swap_transaction, quote_dag
 from sqlmodel import Session, select
 
 from backend.deps import get_indexer, get_rpc_url
@@ -70,14 +70,13 @@ async def _on_chain_quote_for_dag(dag: RouteDAG, amount_in_raw: int, chain_id: i
         from web3 import AsyncWeb3
 
         w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
-        quoted = await quote_swap_transaction(
+        amount_out = await quote_dag(
             dag,
-            amount_in_raw,
-            vm_address,
-            w3,
+            amount_in=amount_in_raw,
+            w3=w3,
+            vm_address=Address(vm_address),
             quoter_address=Address(quoter_address),
         )
-        amount_out = int(quoted.amount)
         note = "on-chain quote is zero (no effective liquidity at current state)" if amount_out == 0 else ""
         return amount_out, note
     except Exception as exc:

@@ -8,6 +8,7 @@ POST /api/swap/build  — compile DeFiVM execute() calldata for a swap
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
 
 from eth_contract import Contract
@@ -18,16 +19,78 @@ from pydefi.aggregator.base import AggregatorQuote
 from pydefi.deployments import get_address
 from pydefi.exceptions import NoRouteFoundError
 from pydefi.indexer import Pool, V2SyncEvent, V3SwapEvent
+from pydefi.indexer.models import IndexerState
 from pydefi.pathfinder.graph import PoolEdge, PoolGraph, V3PoolEdge
+from pydefi.pathfinder.hermes import HermesRouter, from_pool_graph
 from pydefi.pathfinder.router import Router
 from pydefi.types import ZERO_ADDRESS, Address, RouteDAG, RouteSplit, RouteSplitLeg, RouteSwap, Token, TokenAmount
 from pydefi.vm import Program, build_execution_program_for_dag
 from pydefi.vm.swap import build_swap_transaction, quote_dag
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from backend.deps import get_indexer, get_rpc_url
 
 router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# Router cache — amortise PoolGraph build + Hermes preprocessing across requests
+#
+# Each request used to rebuild the PoolGraph from indexer rows (~1 ms / 30
+# pools) and run the full Hermes pipeline (tree decomposition + chordal +
+# DPC, ~30–90 ms at 100–1k tokens). Within a single block the indexed pool
+# state is identical, so most user-facing rapid-fire quotes (typing in the
+# Amount-In input → multiple debounced requests) share state exactly.
+#
+# Cache is keyed by (state_version, solver) where state_version is the max
+# IndexerState.last_indexed_block — monotonically increasing whenever any
+# pool got new events. On miss we fall back to a fresh build; on hit we
+# reuse both the PoolGraph and the lazily-built HermesRouter.
+# ---------------------------------------------------------------------------
+
+_ROUTER_CACHE_SIZE = 4
+_router_cache: OrderedDict[tuple[int, str], tuple[PoolGraph, HermesRouter | None]] = OrderedDict()
+
+
+def _state_version(session: Session) -> int:
+    """Monotonic indexer-state version. Bumps on any new block with pool events."""
+    result = session.exec(select(func.max(IndexerState.last_indexed_block))).first()
+    return int(result or 0)
+
+
+def _cached_graph_and_hermes(session: Session, pools: list[Pool], solver: str) -> tuple[PoolGraph, HermesRouter | None]:
+    """Return (graph, hermes_or_None) for *solver*, building + caching on miss.
+
+    Hermes is built eagerly on miss only when ``solver == 'hermes'``; the
+    hop_dp path doesn't need it and we avoid the ~30 ms preprocessing cost.
+    """
+    key = (_state_version(session), solver)
+    cached = _router_cache.get(key)
+    if cached is not None:
+        _router_cache.move_to_end(key)
+        return cached
+    graph = _build_graph(session, pools)
+    hermes: HermesRouter | None = None
+    if solver == "hermes":
+        hermes = HermesRouter.build(from_pool_graph(graph))
+    _router_cache[key] = (graph, hermes)
+    while len(_router_cache) > _ROUTER_CACHE_SIZE:
+        _router_cache.popitem(last=False)  # evict oldest
+    return graph, hermes
+
+
+def _make_router(
+    graph: PoolGraph,
+    hermes: HermesRouter | None,
+    solver: str,
+    *,
+    max_hops: int = 3,
+) -> Router:
+    """Construct a Router and inject the cached HermesRouter when applicable."""
+    r = Router(graph, max_hops=max_hops, candidate_solver=solver)
+    if hermes is not None and solver == "hermes":
+        r._hermes = hermes
+    return r
+
 
 # Chains not yet in pydefi/deployments.py — residual fallback only.
 _V3_QUOTER_EXTRA: dict[int, str] = {
@@ -385,7 +448,7 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
         pools = session.exec(select(Pool)).all()
         if not pools:
             raise HTTPException(status_code=422, detail="No indexed pools found. Run a backfill first.")
-        graph = _build_graph(session, list(pools))
+        graph, hermes_cached = _cached_graph_and_hermes(session, list(pools), solver_raw)
 
     if isinstance(_path_raw, list) and len(_path_raw) > 2:
         path_tokens = [_token_from_body(t) for t in _path_raw]
@@ -403,7 +466,7 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=422, detail=f"split_fractions_bps invalid: {exc}")
 
-        hop_router = Router(graph, max_hops=1, candidate_solver=solver_raw)
+        hop_router = _make_router(graph, hermes_cached, solver_raw, max_hops=1)
         combined_actions: list = []
         cur_amount = amount_in_raw
         for i in range(len(path_tokens) - 1):
@@ -464,7 +527,7 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
         )
         return out_raw, chosen_dag, impact
 
-    router_obj = Router(graph, candidate_solver=solver_raw)
+    router_obj = _make_router(graph, hermes_cached, solver_raw)
     try:
         amount_out_raw, dag, price_impact_str = _route_and_dag(router_obj)
     except NoRouteFoundError:
@@ -478,6 +541,7 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
                 ),
             )
         graph = await _augment_graph_on_demand(graph, tok_in, tok_out, rpc_url)
+        # Augmented graph differs from cached one — fresh Router (no cache hit).
         router_obj = Router(graph, candidate_solver=solver_raw)
         try:
             amount_out_raw, dag, price_impact_str = _route_and_dag(router_obj)

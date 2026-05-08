@@ -372,6 +372,14 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
     if amount_in_raw <= 0:
         raise HTTPException(status_code=422, detail="amount_in must be positive.")
 
+    # Candidate-discovery solver. "hop_dp" is the default hop-bounded DP;
+    # "hermes" uses the treewidth-parameterized SSSP (no hop cap, finds
+    # long-tail routes the DP misses outright but with a higher per-query
+    # cost at our scale).
+    solver_raw = body.get("solver") or "hop_dp"
+    if solver_raw not in ("hop_dp", "hermes"):
+        raise HTTPException(status_code=422, detail=f"solver must be 'hop_dp' or 'hermes', got {solver_raw!r}")
+
     indexer = get_indexer()
     with Session(indexer._engine) as session:
         pools = session.exec(select(Pool)).all()
@@ -395,7 +403,7 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=422, detail=f"split_fractions_bps invalid: {exc}")
 
-        hop_router = Router(graph, max_hops=1)
+        hop_router = Router(graph, max_hops=1, candidate_solver=solver_raw)
         combined_actions: list = []
         cur_amount = amount_in_raw
         for i in range(len(path_tokens) - 1):
@@ -456,7 +464,7 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
         )
         return out_raw, chosen_dag, impact
 
-    router_obj = Router(graph)
+    router_obj = Router(graph, candidate_solver=solver_raw)
     try:
         amount_out_raw, dag, price_impact_str = _route_and_dag(router_obj)
     except NoRouteFoundError:
@@ -470,7 +478,7 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
                 ),
             )
         graph = await _augment_graph_on_demand(graph, tok_in, tok_out, rpc_url)
-        router_obj = Router(graph)
+        router_obj = Router(graph, candidate_solver=solver_raw)
         try:
             amount_out_raw, dag, price_impact_str = _route_and_dag(router_obj)
         except NoRouteFoundError:

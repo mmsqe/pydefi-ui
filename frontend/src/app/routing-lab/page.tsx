@@ -213,6 +213,10 @@ export default function RoutingLabPage() {
   const [amountIn, setAmountIn] = useState("1");
   // splitFractions: null = auto; array of percentages summing to 100 = manual N-way split
   const [splitFractions, setSplitFractions] = useState<number[] | null>(null);
+  // Candidate-discovery solver. "hop_dp" (default) is pydefi's hop-bounded DP;
+  // "hermes" routes through the treewidth-parameterized SSSP (Paper C, no hop
+  // cap — finds long-tail routes the DP misses).
+  const [solver, setSolver] = useState<"hop_dp" | "hermes">("hop_dp");
   // selectedLane: which split lane is highlighted — tracks both section and leg index
   const [selectedLane, setSelectedLane] = useState<{ si: number; li: number } | null>(null);
   // fracs of the clicked section (may differ from the global autoFracs)
@@ -326,6 +330,7 @@ export default function RoutingLabPage() {
         baseBody.path = waypoints.map((sym) => tokenNodes[sym]).filter(Boolean);
         if (splitFractions !== null) baseBody.split_fractions_bps = splitFractions.map((p) => p * 100);
       }
+      if (solver === "hermes") baseBody.solver = "hermes";
       // Fire on-chain (slow, ~3s RPC) in parallel; merge when it arrives.
       fetchQuoteOnChain(baseBody).then((data) => {
         if (!data || gen !== quoteGen.current) return;
@@ -353,7 +358,7 @@ export default function RoutingLabPage() {
     } finally {
       if (gen === quoteGen.current) setQuoting(false);
     }
-  }, [waypoints, amountIn, splitFractions, tokenNodes]);
+  }, [waypoints, amountIn, splitFractions, solver, tokenNodes]);
 
   // ── URL state sync ───────────────────────────────────────────────────────────
 
@@ -361,6 +366,7 @@ export default function RoutingLabPage() {
     const t = p.get("t");
     const a = p.get("a");
     const s = p.get("s");
+    const cs = p.get("cs");
     const tokens = t ? t.split(",").filter(Boolean) : [];
     if (tokens.length < 2 && !a) return;
     isRestoringFromUrl.current = true;
@@ -370,6 +376,7 @@ export default function RoutingLabPage() {
       const parts = s.split(",").map(Number);
       if (parts.length >= 2 && parts.every((n) => !isNaN(n) && n > 0)) setSplitFractions(parts);
     }
+    if (cs === "hermes") setSolver("hermes");
   });
 
   useUrlWrite(() => {
@@ -377,8 +384,9 @@ export default function RoutingLabPage() {
     if (waypoints.length > 0) p.set("t", waypoints.join(","));
     if (amountIn && amountIn !== "1") p.set("a", amountIn);
     if (splitFractions) p.set("s", splitFractions.join(","));
+    if (solver !== "hop_dp") p.set("cs", solver);
     return p;
-  }, [waypoints, amountIn, splitFractions]);
+  }, [waypoints, amountIn, splitFractions, solver]);
 
   // Reset manual split and selection when the path changes (skip during URL restore)
   useEffect(() => {
@@ -392,7 +400,7 @@ export default function RoutingLabPage() {
     if (waypoints.length < 2) return;
     const t = setTimeout(fetchQuote, 400);
     return () => clearTimeout(t);
-  }, [waypoints, amountIn, splitFractions, fetchQuote]);
+  }, [waypoints, amountIn, splitFractions, solver, fetchQuote]);
 
   // ── Active route highlight + lane breakdown ───────────────────────────────
 
@@ -547,15 +555,34 @@ export default function RoutingLabPage() {
             )}
           </div>
 
-          {/* Amount in */}
-          <div>
-            <label className="text-[10px] text-muted uppercase tracking-wider block mb-1.5">Amount In</label>
-            <input
-              type="number" min="0" step="any" value={amountIn}
-              onChange={(e) => setAmountIn(e.target.value)}
-              className="w-full bg-[#0d1117] border border-border-dim rounded-lg px-3 py-1.5 text-xs text-[#e8eaf0] focus:outline-none focus:border-cyan/40"
-              placeholder="1.0"
-            />
+          {/* Amount in + candidate-discovery solver */}
+          <div className="flex gap-2">
+            <div className="flex-1">
+              <label className="text-[10px] text-muted uppercase tracking-wider block mb-1.5">Amount In</label>
+              <input
+                type="number" min="0" step="any" value={amountIn}
+                onChange={(e) => setAmountIn(e.target.value)}
+                className="w-full bg-[#0d1117] border border-border-dim rounded-lg px-3 py-1.5 text-xs text-[#e8eaf0] focus:outline-none focus:border-cyan/40"
+                placeholder="1.0"
+              />
+            </div>
+            <div className="w-32">
+              <label
+                className="text-[10px] text-muted uppercase tracking-wider block mb-1.5"
+                title="Candidate-discovery solver. hop_dp: hop-bounded DP (default, fast at small N). hermes: treewidth-parameterized SSSP (Paper C, no hop cap — finds long-tail routes the DP misses)."
+              >
+                Solver
+              </label>
+              <select
+                value={solver}
+                onChange={(e) => setSolver(e.target.value as "hop_dp" | "hermes")}
+                className="w-full bg-[#0d1117] border border-border-dim rounded-lg px-2 py-1.5 text-xs text-[#e8eaf0] focus:outline-none focus:border-cyan/40"
+                title={solver === "hermes" ? "Hermes: treewidth-parameterized SSSP, no hop cap" : "Hop-bounded DP, max_hops=3"}
+              >
+                <option value="hop_dp">hop_dp</option>
+                <option value="hermes">hermes</option>
+              </select>
+            </div>
           </div>
 
           {/* Quote status */}
@@ -584,6 +611,14 @@ export default function RoutingLabPage() {
               <div className="flex items-center gap-2 bg-[#0d1117] border border-border-dim rounded-lg px-3 py-2">
                 <span className="font-mono text-xs text-[#e8eaf0]">{amountIn} {quote.token_in}</span>
                 <ArrowRight size={12} className="text-muted flex-shrink-0" />
+                {solver === "hermes" && (
+                  <span
+                    className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-cyan/30 text-cyan/80"
+                    title="Candidates discovered via Hermes treewidth-parameterized SSSP (no hop cap)"
+                  >
+                    hermes
+                  </span>
+                )}
                 <span className="font-mono text-xs font-semibold ml-auto" style={{ color: "#00ff87" }}>
                   {parseFloat(quote.amount_out_human).toPrecision(6)} {quote.token_out}
                 </span>

@@ -79,6 +79,10 @@ export interface SwapRequest {
   // multi-hop routing (routing-lab): explicit waypoints + optional split fractions
   path?: TokenRef[];
   split_fractions_bps?: number[];
+  // candidate-discovery solver. "hop_dp" (default) is the hop-bounded DP;
+  // "hermes" is the treewidth-parameterized SSSP (no hop cap, finds long-tail
+  // routes the DP misses, slower per query at small graph sizes).
+  solver?: "hop_dp" | "hermes";
   // build-only fields
   slippage_bps?: number;
   sender?: string;

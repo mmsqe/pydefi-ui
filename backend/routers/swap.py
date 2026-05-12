@@ -65,9 +65,7 @@ def _state_version(session: Session) -> int:
     return int(result or 0)
 
 
-def _try_incremental_hermes_update(
-    prev_hermes: HermesRouter, new_pool_graph: PoolGraph
-) -> tuple[HermesRouter, bool]:
+def _try_incremental_hermes_update(prev_hermes: HermesRouter, new_pool_graph: PoolGraph) -> tuple[HermesRouter, bool]:
     """Mutate *prev_hermes* in place to reflect *new_pool_graph*.
 
     Returns ``(hermes, incremental)`` where ``incremental`` is True iff the
@@ -544,14 +542,21 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
     if solver_raw not in ("hop_dp", "hermes"):
         raise HTTPException(status_code=422, detail=f"solver must be 'hop_dp' or 'hermes', got {solver_raw!r}")
 
-    # Hop cap for non-waypoint full-route flow; capped at 5 (beyond that, hop_dp
-    # is slower than just using candidate_solver="hermes" which has no cap).
+    # Hop cap for non-waypoint full-route flow. Solver-conditional:
+    # hop_dp's cost is O(b^max_hops) — capped at 5 to keep state-space bounded
+    # at our typical out-degree. Hermes only post-filters Yen's output, so
+    # raising the cap has no runtime cost — no upper bound enforced.
     try:
         max_hops = int(body.get("max_hops", 3))
     except (TypeError, ValueError):
         raise HTTPException(status_code=422, detail="max_hops must be an integer")
-    if not 1 <= max_hops <= 5:
-        raise HTTPException(status_code=422, detail="max_hops must be between 1 and 5")
+    if max_hops < 1:
+        raise HTTPException(status_code=422, detail="max_hops must be >= 1")
+    if solver_raw == "hop_dp" and max_hops > 5:
+        raise HTTPException(
+            status_code=422,
+            detail="max_hops must be between 1 and 5 for solver='hop_dp' (DP cost is exponential). Use solver='hermes' for longer routes.",
+        )
 
     indexer = get_indexer()
     with Session(indexer._engine) as session:
@@ -577,12 +582,9 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
                 raise HTTPException(status_code=422, detail=f"split_fractions_bps invalid: {exc}")
 
         # Waypoint segments are single-hop by the user's explicit intent
-        # (they specified each token in the path). Hermes' candidate solver
-        # ignores max_hops and returns multi-hop alternatives even when
-        # direct pools exist — those leak through ASGM into the per-segment
-        # DAG and break the strict-hop semantics. Force hop_dp here so both
-        # solver choices give the same per-segment behaviour. The user's
-        # solver_raw still applies on the non-waypoint full-route flow.
+        # (they specified each token in the path). Force hop_dp with max_hops=1
+        # so per-segment routing is direct-pool-only regardless of solver_raw;
+        # the user's solver_raw still applies on the non-waypoint full-route flow.
         hop_router = _make_router(graph, hermes_cached, "hop_dp", max_hops=1)
         combined_actions: list = []
         cur_amount = amount_in_raw
@@ -627,9 +629,9 @@ async def _build_dag_from_body(body: dict) -> tuple[RouteDAG, Token, Token, int,
                     if isinstance(exc, ValueError)
                     else f"No indexed pool for {t_in_h.symbol} → {t_out_h.symbol} on chain {t_in_h.chain_id}.",
                 )
-            # Hermes' candidate solver ignores max_hops; verify the returned
-            # DAG is a single-hop path so the waypoint contract holds for
-            # both solvers.
+            # Defensive: hop_router uses max_hops=1, but verify the returned
+            # DAG really is a single hop before stitching it into the waypoint
+            # chain (any multi-hop leak would break the strict-hop contract).
             if _dag_swap_count(hop_dag.actions) > 1:
                 raise HTTPException(
                     status_code=422,

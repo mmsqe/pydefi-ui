@@ -218,9 +218,12 @@ export default function RoutingLabPage() {
   // "hermes" routes through the treewidth-parameterized SSSP (Paper C, no hop
   // cap — finds long-tail routes the DP misses).
   const [solver, setSolver] = useState<"hop_dp" | "hermes">("hop_dp");
-  // Hop cap for the non-waypoint full-route flow (hop_dp solver). 1-5.
-  // Beyond 5, hop_dp's DP table size makes "hermes" cheaper anyway.
+  // Hop cap for the non-waypoint full-route flow. Solver-conditional:
+  // hop_dp scales O(b^max_hops) so we cap at 5 to keep state-space bounded.
+  // Hermes only post-filters Yen's output — no runtime cost from raising it —
+  // so no upper bound (Infinity sentinel). Keep in sync with backend swap.py.
   const [maxHops, setMaxHops] = useState<number>(3);
+  const maxHopsCap = solver === "hermes" ? Infinity : 5;
   // selectedLane: which split lane is highlighted — tracks both section and leg index
   const [selectedLane, setSelectedLane] = useState<{ si: number; li: number } | null>(null);
   // fracs of the clicked section (may differ from the global autoFracs)
@@ -363,7 +366,7 @@ export default function RoutingLabPage() {
     } finally {
       if (gen === quoteGen.current) setQuoting(false);
     }
-  }, [waypoints, amountIn, splitFractions, solver, tokenNodes]);
+  }, [waypoints, amountIn, splitFractions, solver, maxHops, tokenNodes]);
 
   // ── URL state sync ───────────────────────────────────────────────────────────
 
@@ -385,7 +388,9 @@ export default function RoutingLabPage() {
     if (cs === "hermes" || cs === "hop_dp") setSolver(cs);
     if (h) {
       const n = Number(h);
-      if (Number.isInteger(n) && n >= 1 && n <= 5) setMaxHops(n);
+      // Hermes has no upper bound; hop_dp caps at 5 (DP cost is exponential).
+      const cap = cs === "hermes" ? Infinity : 5;
+      if (Number.isInteger(n) && n >= 1 && n <= cap) setMaxHops(n);
     }
   });
 
@@ -407,11 +412,19 @@ export default function RoutingLabPage() {
     setSelectedSectionFracs(null);
   }, [waypoints]);
 
+  // Solver toggle: clamp maxHops down silently when switching from hermes (cap 12)
+  // to hop_dp (cap 5) with a current value above the new cap. Avoids a stuck
+  // "invalid" state where the input shows a value past its max.
+  useEffect(() => {
+    if (maxHops > maxHopsCap) setMaxHops(maxHopsCap);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [solver]);
+
   useEffect(() => {
     if (waypoints.length < 2) return;
     const t = setTimeout(fetchQuote, 400);
     return () => clearTimeout(t);
-  }, [waypoints, amountIn, splitFractions, solver, fetchQuote]);
+  }, [waypoints, amountIn, splitFractions, solver, maxHops, fetchQuote]);
 
   // ── Active route highlight + lane breakdown ───────────────────────────────
 
@@ -580,7 +593,7 @@ export default function RoutingLabPage() {
             <div className="w-32">
               <label
                 className="text-[10px] text-muted uppercase tracking-wider block mb-1.5"
-                title="Candidate-discovery solver. hop_dp: hop-bounded DP (default, fast at small N). hermes: treewidth-parameterized SSSP (Paper C, no hop cap — finds long-tail routes the DP misses)."
+                title="Candidate-discovery solver. hop_dp: hop-bounded DP (default, fast at small N). hermes: treewidth-parameterized SSSP (Paper C) — finds long-tail routes the DP misses; honors max_hops since the realized-output re-rank pass landed."
               >
                 Solver
               </label>
@@ -588,7 +601,7 @@ export default function RoutingLabPage() {
                 value={solver}
                 onChange={(e) => setSolver(e.target.value as "hop_dp" | "hermes")}
                 className="w-full bg-[#0d1117] border border-border-dim rounded-lg px-2 py-1.5 text-xs text-[#e8eaf0] focus:outline-none focus:border-cyan/40"
-                title={solver === "hermes" ? "Hermes: treewidth-parameterized SSSP, no hop cap" : `Hop-bounded DP, max_hops=${maxHops}`}
+                title={`${solver === "hermes" ? "Hermes: treewidth-parameterized SSSP" : "Hop-bounded DP"}, max_hops=${maxHops}`}
               >
                 <option value="hop_dp">hop_dp</option>
                 <option value="hermes">hermes</option>
@@ -597,23 +610,39 @@ export default function RoutingLabPage() {
             <div className="w-20">
               <label
                 className="text-[10px] text-muted uppercase tracking-wider block mb-1.5"
-                title="Hop cap for the hop_dp solver on the non-waypoint full-route flow. 1–5; beyond 5 use solver=hermes (no cap)."
+                title={
+                  solver === "hermes"
+                    ? "Hop cap. Hermes post-filters Yen's output — raising the cap has no cost penalty, so no upper limit is enforced."
+                    : "Hop cap (≤ 5). hop_dp's state space is O(b^max_hops); 5 keeps it bounded. Switch to hermes for longer routes."
+                }
               >
                 max hops
               </label>
               <input
                 type="number"
                 min={1}
-                max={5}
+                {...(Number.isFinite(maxHopsCap) ? { max: maxHopsCap } : {})}
                 step={1}
                 value={maxHops}
                 onChange={(e) => {
-                  const n = Number(e.target.value);
-                  if (Number.isInteger(n) && n >= 1 && n <= 5) setMaxHops(n);
+                  // Permissive during typing: accept any positive integer so
+                  // mid-edit values like "1" (en route to "10") don't snap
+                  // back. Range enforcement happens on blur + solver toggle.
+                  const raw = e.target.value;
+                  if (raw === "") return;
+                  const n = parseInt(raw, 10);
+                  if (Number.isFinite(n) && n >= 1) setMaxHops(n);
                 }}
-                disabled={solver === "hermes"}
-                className="w-full bg-[#0d1117] border border-border-dim rounded-lg px-2 py-1.5 text-xs text-[#e8eaf0] focus:outline-none focus:border-cyan/40 disabled:opacity-40"
-                title={solver === "hermes" ? "Disabled — hermes has no hop cap" : `hop_dp will explore up to ${maxHops} hops`}
+                onBlur={() => {
+                  if (maxHops < 1) setMaxHops(1);
+                  else if (maxHops > maxHopsCap) setMaxHops(maxHopsCap);
+                }}
+                className="w-full bg-[#0d1117] border border-border-dim rounded-lg px-2 py-1.5 text-xs text-[#e8eaf0] focus:outline-none focus:border-cyan/40"
+                title={
+                  Number.isFinite(maxHopsCap)
+                    ? `${solver} will explore up to ${maxHops} hops (cap: ${maxHopsCap})`
+                    : `${solver} will explore up to ${maxHops} hops (no cap)`
+                }
               />
             </div>
           </div>
@@ -648,8 +677,8 @@ export default function RoutingLabPage() {
                   className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-cyan/30 text-cyan/80"
                   title={
                     solver === "hermes"
-                      ? "Candidates discovered via Hermes treewidth-parameterized SSSP (no hop cap)"
-                      : "Candidates discovered via hop-bounded DP (max_hops=3)"
+                      ? `Candidates discovered via Hermes treewidth-parameterized SSSP (max_hops=${maxHops})`
+                      : `Candidates discovered via hop-bounded DP (max_hops=${maxHops})`
                   }
                 >
                   {solver}

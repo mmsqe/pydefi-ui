@@ -43,8 +43,16 @@ router = APIRouter()
 #
 # Cache is keyed by (state_version, solver) where state_version is the max
 # IndexerState.last_indexed_block — monotonically increasing whenever any
-# pool got new events. On miss we fall back to a fresh build; on hit we
-# reuse both the PoolGraph and the lazily-built HermesRouter.
+# pool got new events. On a hit we reuse both the PoolGraph and the
+# lazily-built HermesRouter.
+#
+# On a miss for ``hermes``, we look for the previous hermes cache entry and
+# *incrementally* update it via ``update_weights`` + ``add_edge`` instead of
+# a full rebuild. Paper §4.2: the chordal completion is invariant under
+# weight changes and most edge additions; only Phase 3 (DPC re-enforce)
+# needs to run on a sync. Edge removals or out-of-bag chord additions still
+# trigger a full rebuild as a fallback. This is the paper's headline
+# "9.7 weight updates per block" win, wired to the live indexer.
 # ---------------------------------------------------------------------------
 
 _ROUTER_CACHE_SIZE = 4
@@ -57,11 +65,74 @@ def _state_version(session: Session) -> int:
     return int(result or 0)
 
 
+def _try_incremental_hermes_update(
+    prev_hermes: HermesRouter, new_pool_graph: PoolGraph
+) -> tuple[HermesRouter, bool]:
+    """Mutate *prev_hermes* in place to reflect *new_pool_graph*.
+
+    Returns ``(hermes, incremental)`` where ``incremental`` is True iff the
+    update avoided a full Phases-1-3 rebuild. Edge removals trigger a full
+    rebuild (no in-place primitive); ``add_edge`` may itself trigger one
+    when a new chord doesn't fit the existing chordal completion.
+    """
+    new_nx = from_pool_graph(new_pool_graph)
+    prev_nx = prev_hermes.graph
+    prev_edges = set(prev_nx.edges())
+    new_edges = set(new_nx.edges())
+
+    # Removed edges: no in-place primitive, fall back to full rebuild.
+    if prev_edges - new_edges:
+        rebuilt = HermesRouter.build(new_nx)
+        prev_hermes.graph = rebuilt.graph
+        prev_hermes.treewidth = rebuilt.treewidth
+        prev_hermes.bags = rebuilt.bags
+        prev_hermes.peo = rebuilt.peo
+        prev_hermes.peo_index = rebuilt.peo_index
+        prev_hermes.chordal_neighbors = rebuilt.chordal_neighbors
+        prev_hermes.dpc_weights = rebuilt.dpc_weights
+        prev_hermes.dpc_witness = rebuilt.dpc_witness
+        prev_hermes.adj_weights = rebuilt.adj_weights
+        return prev_hermes, False
+
+    # Collect weight-only updates (existing edges) and additions.
+    updates: dict[tuple, float] = {}
+    additions: list[tuple] = []
+    for u, v, data in new_nx.edges(data=True):
+        new_w = data["weight"]
+        edge_obj = data.get("edge")
+        if prev_nx.has_edge(u, v):
+            if prev_nx[u][v]["weight"] != new_w:
+                updates[(u, v)] = new_w
+                # Refresh stale `edge` reference; update_weights will sync weight.
+                prev_nx[u][v]["edge"] = edge_obj
+        else:
+            additions.append((u, v, new_w, edge_obj))
+
+    if updates:
+        prev_hermes.update_weights(updates)
+
+    incremental = True
+    for u, v, w, edge_obj in additions:
+        # Pre-set the `edge` attribute so it survives both fast and slow paths.
+        if prev_nx.has_node(u) and prev_nx.has_node(v):
+            prev_nx.add_edge(u, v, edge=edge_obj)
+        ok = prev_hermes.add_edge(u, v, w)
+        if not ok:
+            incremental = False
+        # After add_edge the graph reference may have been replaced (slow path);
+        # set the edge attribute on whatever graph the router now references.
+        prev_hermes.graph[u][v]["edge"] = edge_obj
+
+    return prev_hermes, incremental
+
+
 def _cached_graph_and_hermes(session: Session, pools: list[Pool], solver: str) -> tuple[PoolGraph, HermesRouter | None]:
     """Return (graph, hermes_or_None) for *solver*, building + caching on miss.
 
     Hermes is built eagerly on miss only when ``solver == 'hermes'``; the
     hop_dp path doesn't need it and we avoid the ~30 ms preprocessing cost.
+    On miss for hermes, prefers an incremental update from the most recent
+    prior hermes cache entry over a full rebuild — see module-level comment.
     """
     key = (_state_version(session), solver)
     cached = _router_cache.get(key)
@@ -71,7 +142,21 @@ def _cached_graph_and_hermes(session: Session, pools: list[Pool], solver: str) -
     graph = _build_graph(session, pools)
     hermes: HermesRouter | None = None
     if solver == "hermes":
-        hermes = HermesRouter.build(from_pool_graph(graph))
+        # Find and consume the most recent prior hermes entry as the basis
+        # for an incremental update. Pop it so its now-stale state_version
+        # key doesn't shadow the new one.
+        prev_key = next((k for k in reversed(_router_cache) if k[1] == "hermes"), None)
+        if prev_key is not None:
+            _, prev_hermes = _router_cache.pop(prev_key)
+            if prev_hermes is not None:
+                try:
+                    hermes, _ = _try_incremental_hermes_update(prev_hermes, graph)
+                except Exception:  # noqa: BLE001
+                    # Any failure mid-mutation leaves prev_hermes inconsistent;
+                    # don't reinsert it. Fall through to a clean rebuild.
+                    hermes = None
+        if hermes is None:
+            hermes = HermesRouter.build(from_pool_graph(graph))
     _router_cache[key] = (graph, hermes)
     while len(_router_cache) > _ROUTER_CACHE_SIZE:
         _router_cache.popitem(last=False)  # evict oldest

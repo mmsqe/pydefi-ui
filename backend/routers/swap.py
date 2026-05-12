@@ -56,13 +56,26 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 _ROUTER_CACHE_SIZE = 4
-_router_cache: OrderedDict[tuple[int, str], tuple[PoolGraph, HermesRouter | None]] = OrderedDict()
+# Key: (state_version, db_mtime_ns, solver). mtime covers snapshot replacements
+# that don't bump IndexerState.
+_router_cache: OrderedDict[tuple[int, int, str], tuple[PoolGraph, HermesRouter | None]] = OrderedDict()
 
 
 def _state_version(session: Session) -> int:
     """Monotonic indexer-state version. Bumps on any new block with pool events."""
     result = session.exec(select(func.max(IndexerState.last_indexed_block))).first()
     return int(result or 0)
+
+
+def _db_mtime_ns() -> int:
+    """Mtime of ``DB_PATH`` in ns, ``0`` if unreadable — part of the cache key."""
+    db_path = os.environ.get("DB_PATH")
+    if not db_path:
+        return 0
+    try:
+        return os.stat(db_path).st_mtime_ns
+    except OSError:
+        return 0
 
 
 def _try_incremental_hermes_update(prev_hermes: HermesRouter, new_pool_graph: PoolGraph) -> tuple[HermesRouter, bool]:
@@ -132,7 +145,7 @@ def _cached_graph_and_hermes(session: Session, pools: list[Pool], solver: str) -
     On miss for hermes, prefers an incremental update from the most recent
     prior hermes cache entry over a full rebuild — see module-level comment.
     """
-    key = (_state_version(session), solver)
+    key = (_state_version(session), _db_mtime_ns(), solver)
     cached = _router_cache.get(key)
     if cached is not None:
         _router_cache.move_to_end(key)
@@ -143,7 +156,7 @@ def _cached_graph_and_hermes(session: Session, pools: list[Pool], solver: str) -
         # Find and consume the most recent prior hermes entry as the basis
         # for an incremental update. Pop it so its now-stale state_version
         # key doesn't shadow the new one.
-        prev_key = next((k for k in reversed(_router_cache) if k[1] == "hermes"), None)
+        prev_key = next((k for k in reversed(_router_cache) if k[2] == "hermes"), None)
         if prev_key is not None:
             _, prev_hermes = _router_cache.pop(prev_key)
             if prev_hermes is not None:

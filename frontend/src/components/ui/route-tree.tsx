@@ -10,7 +10,7 @@ export function tokenColor(sym: string): string {
 
 const PROTOCOL_COLOR: Record<string, string> = {
   v3: "#00d4ff", uniswapv3: "#00d4ff",
-  v2: "#8b5cf6", uniswapv2: "#8b5cf6", sushiswap: "#8b5cf6",
+  v2: "#8b5cf6", uniswapv2: "#8b5cf6", sushiswap: "#8b5cf6", sushiswapv2: "#8b5cf6",
 };
 export function protocolColor(p: string) {
   return PROTOCOL_COLOR[p.toLowerCase()] ?? "#64748b";
@@ -19,7 +19,7 @@ export function protocolShort(p: string): string {
   const l = p.toLowerCase();
   if (l === "uniswapv3" || l === "v3") return "V3";
   if (l === "uniswapv2" || l === "v2") return "V2";
-  if (l === "sushiswap") return "SushiV2";
+  if (l === "sushiswapv2" || l === "sushiswap") return "SushiV2";
   return p;
 }
 

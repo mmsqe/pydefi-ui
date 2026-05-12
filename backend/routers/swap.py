@@ -206,7 +206,7 @@ def _build_graph(session: Session, pools: list[Pool]) -> PoolGraph:
             decimals=pool.token1_decimals,
         )
 
-        if protocol in ("v2", "sushiswap", "uniswapv2"):
+        if protocol in ("v2", "sushiswapv2", "sushiswap", "uniswapv2"):
             ev = session.exec(
                 select(V2SyncEvent)
                 .where(V2SyncEvent.pool_address == addr)

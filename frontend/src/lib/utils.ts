@@ -64,18 +64,6 @@ export function chainColor(id: number): string {
   return CHAIN_COLORS[id] ?? "#64748b";
 }
 
-export function protocolLabel(protocol: string): string {
-  const map: Record<string, string> = {
-    v2: "V2",
-    v3: "V3",
-    uniswap_v2: "Uni V2",
-    uniswap_v3: "Uni V3",
-    sushiswap: "Sushi",
-    curve: "Curve",
-  };
-  return map[protocol] ?? protocol.toUpperCase();
-}
-
 export function pairLabel(pool: { token0_symbol?: string; token1_symbol?: string; token0_address?: string; token1_address?: string }): string {
   const t0 = pool.token0_symbol ?? (pool.token0_address ? formatAddress(pool.token0_address, 4) : "?");
   const t1 = pool.token1_symbol ?? (pool.token1_address ? formatAddress(pool.token1_address, 4) : "?");

@@ -14,7 +14,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { swrFetcher, fetchQuoteOnChain } from "@/lib/api";
-import { formatNumber } from "@/lib/utils";
+import { formatAmount, formatNumber } from "@/lib/utils";
 import type { Pool } from "@/lib/types";
 import {
   ArrowDownUp,
@@ -413,7 +413,7 @@ export default function SwapPage() {
                   || "On-chain eth_call via DeFiVM quote program (live pool state vs indexed reserves).";
                 return (
                   <div className="text-[10px] font-mono leading-tight mt-1" style={{ color }} title={tip}>
-                    on-chain: {on.toPrecision(6)} {tokenOut} ({sign}{diffPct.toFixed(2)}%)
+                    on-chain: {formatAmount(on)} {tokenOut} ({sign}{diffPct.toFixed(2)}%)
                   </div>
                 );
               }

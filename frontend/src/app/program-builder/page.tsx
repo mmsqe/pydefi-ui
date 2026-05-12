@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useUrlRestoreOnce, useUrlWrite } from "@/lib/use-url-state";
 import { useAccount } from "wagmi";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { cn } from "@/lib/utils";
+import { cn, formatAmount } from "@/lib/utils";
 import {
   ArrowLeftRight,
   RefreshCcw,
@@ -204,7 +204,7 @@ function assemblePseudo(
       case "swap": {
         const q = quotes[b.id];
         const minOut = q?.amount_out_human
-          ? ` → ~${parseFloat(q.amount_out_human).toPrecision(5)} ${c.token_out} (${c.slippage_bps ?? "50"} bps slippage)`
+          ? ` → ~${formatAmount(q.amount_out_human)} ${c.token_out} (${c.slippage_bps ?? "50"} bps slippage)`
           : "";
         lines.push(`; build_swap_transaction(dag, amount_in, defi_vm, sender)`);
         lines.push(`SWAP  ${c.amount_in ?? "?"} ${c.token_in ?? "?"} → ${c.token_out ?? "?"}${minOut}`);
@@ -356,7 +356,7 @@ function BlockConfigForm({
               )}
               {quote?.amount_out_human && !quote.loading && (
                 <span className="text-xs text-green-400 font-mono">
-                  ≈ {parseFloat(quote.amount_out_human).toPrecision(6)} {c.token_out}
+                  ≈ {formatAmount(quote.amount_out_human)} {c.token_out}
                   {quote.price_impact && quote.price_impact !== "NaN" && (
                     <span className="text-muted ml-1 text-[10px]">
                       ({(parseFloat(quote.price_impact) * 100).toFixed(2)}% impact)
@@ -375,7 +375,7 @@ function BlockConfigForm({
                   || "On-chain eth_call via DeFiVM quote program (live pool state vs indexed reserves). Large divergence suggests stale index, V3 tick-crossing, or a bad route.";
                 return (
                   <span className="text-[10px] font-mono leading-tight" style={{ color }} title={tip}>
-                    on-chain: {on.toPrecision(6)} {c.token_out} ({sign}{diffPct.toFixed(2)}%)
+                    on-chain: {formatAmount(on)} {c.token_out} ({sign}{diffPct.toFixed(2)}%)
                   </span>
                 );
               })()}
@@ -870,7 +870,7 @@ export default function ProgramBuilderPage() {
                           {/* Quote badge */}
                           {block.type === "swap" && quotes[block.id]?.amount_out_human && !quotes[block.id]?.loading && (
                             <span className="text-[10px] text-green-400 font-mono">
-                              ≈{parseFloat(quotes[block.id].amount_out_human!).toPrecision(4)} {block.config.token_out}
+                              ≈{formatAmount(quotes[block.id].amount_out_human!)} {block.config.token_out}
                             </span>
                           )}
                           {block.type === "swap" && quotes[block.id]?.dag?.actions.some((a) => a.type === "split") && !quotes[block.id]?.loading && (

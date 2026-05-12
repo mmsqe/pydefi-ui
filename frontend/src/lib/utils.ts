@@ -9,6 +9,21 @@ export function formatAddress(addr: string, chars = 6): string {
   return `${addr.slice(0, chars)}...${addr.slice(-chars + 2)}`;
 }
 
+/**
+ * Format a token amount for display — no scientific notation, thousands
+ * separators on the integer part. Large amounts get up to 4 fraction digits;
+ * sub-unit values fall back to 6 significant digits so dust isn't truncated.
+ */
+export function formatAmount(n: number | string | undefined | null): string {
+  if (n === undefined || n === null || n === "") return "—";
+  const num = typeof n === "string" ? parseFloat(n) : n;
+  if (!isFinite(num)) return "—";
+  const abs = Math.abs(num);
+  if (abs === 0) return "0";
+  if (abs >= 1) return num.toLocaleString("en-US", { maximumFractionDigits: 4 });
+  return num.toLocaleString("en-US", { maximumSignificantDigits: 6 });
+}
+
 export function formatNumber(n: number | string | undefined | null, precision = 4): string {
   if (n === undefined || n === null || n === "") return "—";
   const num = typeof n === "string" ? parseFloat(n) : n;

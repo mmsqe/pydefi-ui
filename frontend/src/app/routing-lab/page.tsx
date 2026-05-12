@@ -5,6 +5,7 @@ import { useUrlRestoreOnce, useUrlWrite } from "@/lib/use-url-state";
 import { Card, CardContent } from "@/components/ui/card";
 import { Loader, RefreshCw, ArrowRight, X } from "lucide-react";
 import { fetchPools, fetchQuote as apiFetchQuote, fetchQuoteOnChain } from "@/lib/api";
+import { formatAmount } from "@/lib/utils";
 import type { Pool, SwapRequest } from "@/lib/types";
 import {
   RouteTree, flattenDAG, tokenColor, protocolColor,
@@ -654,7 +655,7 @@ export default function RoutingLabPage() {
                   {solver}
                 </span>
                 <span className="font-mono text-xs font-semibold ml-auto" style={{ color: "#00ff87" }}>
-                  {parseFloat(quote.amount_out_human).toPrecision(6)} {quote.token_out}
+                  {formatAmount(quote.amount_out_human)} {quote.token_out}
                 </span>
                 {quote.price_impact !== "NaN" && (
                   <span className={`text-[10px] font-mono ${
@@ -679,7 +680,7 @@ export default function RoutingLabPage() {
                     || "On-chain eth_call via DeFiVM quote program (live pool state vs indexed reserves).";
                   return (
                     <div className="text-[10px] font-mono leading-tight px-3" title={tip} style={{ color }}>
-                      on-chain: {on.toPrecision(6)} {quote.token_out} ({sign}{diffPct.toFixed(2)}%)
+                      on-chain: {formatAmount(on)} {quote.token_out} ({sign}{diffPct.toFixed(2)}%)
                     </div>
                   );
                 }

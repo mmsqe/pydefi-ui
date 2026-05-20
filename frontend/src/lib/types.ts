@@ -71,6 +71,68 @@ export interface TokenRef {
   chain_id: number;
 }
 
+// ── Yields ───────────────────────────────────────────────────────────────────
+
+/** Matches backend ``_token_to_dict`` and ``_token_from_body``. */
+export interface YieldToken {
+  chain_id: number;
+  address: string;
+  symbol: string;
+  decimals: number;
+}
+
+/** Matches backend ``_market_to_dict`` — sent back verbatim to ``/yields/route``. */
+export interface YieldMarket {
+  market_id: string;
+  protocol: "aave_v3" | "compound_v3";
+  chain_id: number;
+  token: YieldToken;
+  supply_apy: string;          // Decimal-string, e.g. "0.0345"
+  utilization: string;
+  available_liquidity: string; // raw sub-units
+  available_liquidity_human: string;
+}
+
+export interface YieldPosition {
+  market: YieldMarket;
+  balance: string;        // raw sub-units
+  balance_human: string;
+}
+
+export type YieldStrategy = "supply_then_bridge" | "withdraw_then_supply" | "bridge_then_supply";
+export type YieldStepKind = "approve" | "supply" | "withdraw" | "bridge";
+
+export interface YieldTx {
+  to: string;
+  data: string;
+  value: string;
+  gas: string;
+}
+
+export interface YieldStep {
+  kind: YieldStepKind;
+  chain_id: number;
+  tx: YieldTx;
+}
+
+export interface YieldRoute {
+  route_id: string;
+  strategy: YieldStrategy;
+  source_chain: number;
+  target_chain: number | null;
+  target_market: YieldMarket | null;
+  steps: YieldStep[];
+}
+
+export interface BuildYieldRouteRequest {
+  strategy: YieldStrategy;
+  user: string;
+  amount_in: { token: YieldToken; amount: string };
+  target_market: YieldMarket;
+  source_market?: YieldMarket;
+  target_chain?: number;
+}
+
 export interface SwapRequest {
   token_in: TokenRef;
   token_out: TokenRef;

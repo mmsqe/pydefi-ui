@@ -13,6 +13,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Zap,
+  PiggyBank,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebar } from "./sidebar-context";
@@ -21,6 +22,7 @@ const NAV_ITEMS = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/pools", label: "Pools", icon: Waves },
   { href: "/swap", label: "Swap", icon: ArrowLeftRight },
+  { href: "/yields", label: "Yields", icon: PiggyBank },
   { href: "/routing-lab", label: "Routing Lab", icon: FlaskConical },
   { href: "/program-builder", label: "Program Builder", icon: Blocks },
   { href: "/indexer", label: "Indexer", icon: Activity },

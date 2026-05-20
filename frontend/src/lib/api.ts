@@ -6,6 +6,10 @@ import type {
   IndexerStateItem,
   RunBackfillBody,
   SwapRequest,
+  YieldMarket,
+  YieldPosition,
+  YieldRoute,
+  BuildYieldRouteRequest,
 } from "./types";
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -128,6 +132,49 @@ export async function buildSwap(body: SwapRequest): Promise<Record<string, unkno
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+// ── Yields endpoints ────────────────────────────────────────────────────────
+
+function _qs(params: Record<string, string | number | undefined | null>): string {
+  const entries = Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== "");
+  if (!entries.length) return "";
+  return "?" + new URLSearchParams(entries.map(([k, v]) => [k, String(v)])).toString();
+}
+
+export async function fetchYieldMarkets(params: {
+  token_symbol: string;
+  chains?: string;     // CSV, e.g. "1,8453"
+  protocols?: string;  // CSV, e.g. "aave_v3,compound_v3"
+}): Promise<YieldMarket[]> {
+  return apiFetch<YieldMarket[]>(`/api/yields/markets${_qs(params)}`);
+}
+
+export async function fetchYieldPositions(params: {
+  user: string;
+  token_symbol: string;
+  chains?: string;
+  protocols?: string;
+}): Promise<YieldPosition[]> {
+  return apiFetch<YieldPosition[]>(`/api/yields/positions${_qs(params)}`);
+}
+
+export async function buildYieldRoute(body: BuildYieldRouteRequest): Promise<YieldRoute> {
+  return apiFetch<YieldRoute>("/api/yields/route", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function fetchBestRebalance(params: {
+  user: string;
+  token_symbol: string;
+  horizon_seconds?: number;
+  min_apy_gain_bps?: number;
+  chains?: string;
+  protocols?: string;
+}): Promise<{ route: YieldRoute | null; reason?: string }> {
+  return apiFetch(`/api/yields/rebalance/best${_qs(params)}`);
 }
 
 // ── SWR fetcher ─────────────────────────────────────────────────────────────

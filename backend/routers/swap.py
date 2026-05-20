@@ -371,7 +371,70 @@ def _build_graph(session: Session, pools: list[Pool]) -> PoolGraph:
                 )
             )
 
+    # Curve StableSwap pools — sidecar `curvepoolstaterow` table written by
+    # the offline snapshot script. The live indexer doesn't yet track Curve
+    # state, so this branch only fires when DB_PATH points at a snapshot DB
+    # (e.g. tests/live/mainnet_pools.db). Each pool row materialises N×(N-1)
+    # bilateral CurvePoolEdge instances sharing one CurvePoolState.
+    _add_curve_edges_if_present(graph, session)
     return graph
+
+
+def _add_curve_edges_if_present(graph: PoolGraph, session: Session) -> None:
+    """Read Curve pool snapshot rows (if the table exists) and add edges.
+
+    The table name matches what ``scripts/snapshot_mainnet_pools.py`` writes;
+    a freshly-indexed live DB won't have it and this is a no-op there.
+    """
+    import json
+
+    from pydefi.pathfinder.graph import CurvePoolEdge, CurvePoolState
+
+    raw = session.connection().connection
+    cur = raw.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='curvepoolstaterow'")
+    if cur.fetchone() is None:
+        return
+
+    rows = (
+        session.connection()
+        .connection.execute(
+            "SELECT pool_address, chain_id, a_coefficient, n_coins, coins_json, fee_bps FROM curvepoolstaterow"
+        )
+        .fetchall()
+    )
+    for pool_address_s, chain_id_s, a_s, _n, coins_json, fee_bps_s in rows:
+        coins_data = json.loads(coins_json)
+        coin_tokens = [
+            Token(
+                chain_id=int(chain_id_s),
+                address=Address(c["address"]),
+                symbol=c["symbol"],
+                decimals=int(c["decimals"]),
+            )
+            for c in coins_data
+        ]
+        state = CurvePoolState(
+            pool_address=Address(pool_address_s),
+            a_coefficient=int(a_s),
+            balances=tuple(int(c["balance"]) for c in coins_data),
+            rates=tuple(int(c["rate"]) for c in coins_data),
+        )
+        for i in range(len(coin_tokens)):
+            for j in range(len(coin_tokens)):
+                if i == j:
+                    continue
+                graph.add_pool(
+                    CurvePoolEdge(
+                        token_in=coin_tokens[i],
+                        token_out=coin_tokens[j],
+                        pool_address=state.pool_address,
+                        protocol="Curve",
+                        fee_bps=int(fee_bps_s) or 4,
+                        i_in=i,
+                        i_out=j,
+                        state=state,
+                    )
+                )
 
 
 # ---------------------------------------------------------------------------

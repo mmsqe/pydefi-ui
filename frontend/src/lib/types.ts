@@ -84,7 +84,7 @@ export interface YieldToken {
 /** Matches backend ``_market_to_dict`` — sent back verbatim to ``/yields/route``. */
 export interface YieldMarket {
   market_id: string;
-  protocol: "aave_v3" | "compound_v3";
+  protocol: "aave_v3" | "compound_v3" | "morpho";
   chain_id: number;
   token: YieldToken;
   supply_apy: string;          // Decimal-string, e.g. "0.0345"

@@ -7,6 +7,8 @@ import {
   AlertCircle,
   CheckCircle,
   ChevronDown,
+  ChevronUp,
+  ChevronsUpDown,
   ExternalLink,
   Loader,
   X,
@@ -247,6 +249,48 @@ function RouteExecutor({ route, onClose, onCompleted }: RouteExecutorProps) {
 }
 
 // ---------------------------------------------------------------------------
+// Sortable markets table header
+// ---------------------------------------------------------------------------
+
+type MarketSortKey = "supply_apy" | "utilization" | "liquidity";
+
+function SortHeader({
+  label,
+  column,
+  sortKey,
+  sortDir,
+  onSort,
+}: {
+  label: string;
+  column: MarketSortKey;
+  sortKey: MarketSortKey;
+  sortDir: "asc" | "desc";
+  onSort: (key: MarketSortKey) => void;
+}) {
+  const active = sortKey === column;
+  return (
+    <th className="text-right font-medium py-2">
+      <button
+        type="button"
+        onClick={() => onSort(column)}
+        className={`inline-flex items-center gap-1 transition-colors ${
+          active ? "text-cyan" : "hover:text-[#e8eaf0]"
+        }`}
+      >
+        {label}
+        {!active ? (
+          <ChevronsUpDown size={11} className="opacity-40" />
+        ) : sortDir === "desc" ? (
+          <ChevronDown size={11} />
+        ) : (
+          <ChevronUp size={11} />
+        )}
+      </button>
+    </th>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
 
@@ -257,6 +301,8 @@ export default function YieldsPage() {
   const [activeRoute, setActiveRoute] = useState<YieldRoute | null>(null);
   const [routeError, setRouteError] = useState<string | null>(null);
   const [routePending, setRoutePending] = useState(false);
+  const [sortKey, setSortKey] = useState<MarketSortKey>("supply_apy");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
   const marketsKey = `markets:${tokenSymbol}`;
   const { data: markets, isLoading: marketsLoading } = useSWR<YieldMarket[]>(
@@ -264,6 +310,29 @@ export default function YieldsPage() {
     () => fetchYieldMarkets({ token_symbol: tokenSymbol }),
     { revalidateOnFocus: false },
   );
+
+  const toggleSort = useCallback(
+    (key: MarketSortKey) => {
+      if (key === sortKey) {
+        setSortDir((d) => (d === "desc" ? "asc" : "desc"));
+      } else {
+        setSortKey(key);
+        setSortDir("desc");
+      }
+    },
+    [sortKey],
+  );
+
+  const sortedMarkets = useMemo(() => {
+    if (!markets) return [];
+    const metric = (m: YieldMarket): number => {
+      if (sortKey === "utilization") return parseFloat(m.utilization);
+      if (sortKey === "liquidity") return parseFloat(m.available_liquidity_human);
+      return parseFloat(m.supply_apy);
+    };
+    const ordered = [...markets].sort((a, b) => metric(a) - metric(b));
+    return sortDir === "desc" ? ordered.reverse() : ordered;
+  }, [markets, sortKey, sortDir]);
 
   const positionsKey = address ? `positions:${address}:${tokenSymbol}` : null;
   const { data: positions, mutate: mutatePositions } = useSWR<YieldPosition[]>(
@@ -472,14 +541,32 @@ export default function YieldsPage() {
                 <tr className="border-b border-border-dim">
                   <th className="text-left font-medium py-2">Protocol</th>
                   <th className="text-left font-medium py-2">Chain</th>
-                  <th className="text-right font-medium py-2">APY</th>
-                  <th className="text-right font-medium py-2">Utilization</th>
-                  <th className="text-right font-medium py-2">Liquidity</th>
+                  <SortHeader
+                    label="APY"
+                    column="supply_apy"
+                    sortKey={sortKey}
+                    sortDir={sortDir}
+                    onSort={toggleSort}
+                  />
+                  <SortHeader
+                    label="Utilization"
+                    column="utilization"
+                    sortKey={sortKey}
+                    sortDir={sortDir}
+                    onSort={toggleSort}
+                  />
+                  <SortHeader
+                    label="Liquidity"
+                    column="liquidity"
+                    sortKey={sortKey}
+                    sortDir={sortDir}
+                    onSort={toggleSort}
+                  />
                   <th className="text-right font-medium py-2"></th>
                 </tr>
               </thead>
               <tbody>
-                {markets.map((m) => (
+                {sortedMarkets.map((m) => (
                   <tr key={m.market_id} className="border-b border-border-dim/40">
                     <td className="py-2">{m.protocol}</td>
                     <td className="py-2 font-mono">{m.chain_id}</td>

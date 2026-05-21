@@ -145,7 +145,7 @@ function _qs(params: Record<string, string | number | undefined | null>): string
 export async function fetchYieldMarkets(params: {
   token_symbol: string;
   chains?: string;     // CSV, e.g. "1,8453"
-  protocols?: string;  // CSV, e.g. "aave_v3,compound_v3"
+  protocols?: string;  // CSV, e.g. "aave_v3,compound_v3,morpho,aave_v4"
 }): Promise<YieldMarket[]> {
   return apiFetch<YieldMarket[]>(`/api/yields/markets${_qs(params)}`);
 }

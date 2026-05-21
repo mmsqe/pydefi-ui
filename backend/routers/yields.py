@@ -1,7 +1,7 @@
 """
 Yields-as-a-Service routes — wraps :mod:`pydefi.yields`.
 
-GET  /api/yields/markets          — enumerate Aave V3 + Compound V3 + Morpho supply markets
+GET  /api/yields/markets          — enumerate Aave V3 + Compound V3 + Morpho + Aave V4 supply markets
 GET  /api/yields/positions        — user's non-zero supply balances
 POST /api/yields/route            — build a sequenced execution plan
 GET  /api/yields/rebalance/best   — best same-chain rebalance, or null
@@ -202,9 +202,9 @@ async def list_markets(
     chains: str | None = Query(None, description="Comma-separated chain ids (default: all known)"),
     protocols: str | None = Query(None, description=f"Comma-separated subset of {list(_VALID_PROTOCOLS)}"),
 ) -> list[dict]:
-    """Enumerate active Aave V3 + Compound V3 + Morpho supply markets for
-    *token_symbol*, sorted by APY descending. Chains without a configured RPC
-    are skipped."""
+    """Enumerate active Aave V3 + Compound V3 + Morpho + Aave V4 supply markets
+    for *token_symbol*, sorted by APY descending. Chains without a configured
+    RPC are skipped."""
     w3s = get_w3s()
     markets = await get_yield_markets(
         token_symbol,

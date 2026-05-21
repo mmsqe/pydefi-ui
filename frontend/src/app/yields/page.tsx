@@ -22,7 +22,7 @@ import {
   fetchYieldMarkets,
   fetchYieldPositions,
 } from "@/lib/api";
-import { formatNumber } from "@/lib/utils";
+import { chainName, formatNumber } from "@/lib/utils";
 import type {
   YieldMarket,
   YieldPosition,
@@ -252,7 +252,7 @@ function RouteExecutor({ route, onClose, onCompleted }: RouteExecutorProps) {
 // Sortable markets table header
 // ---------------------------------------------------------------------------
 
-type MarketSortKey = "supply_apy" | "utilization" | "liquidity";
+type MarketSortKey = "protocol" | "supply_apy" | "utilization" | "liquidity";
 
 function SortHeader({
   label,
@@ -260,16 +260,18 @@ function SortHeader({
   sortKey,
   sortDir,
   onSort,
+  align = "right",
 }: {
   label: string;
   column: MarketSortKey;
   sortKey: MarketSortKey;
   sortDir: "asc" | "desc";
   onSort: (key: MarketSortKey) => void;
+  align?: "left" | "right";
 }) {
   const active = sortKey === column;
   return (
-    <th className="text-right font-medium py-2">
+    <th className={`${align === "left" ? "text-left" : "text-right"} font-medium py-2`}>
       <button
         type="button"
         onClick={() => onSort(column)}
@@ -325,12 +327,16 @@ export default function YieldsPage() {
 
   const sortedMarkets = useMemo(() => {
     if (!markets) return [];
-    const metric = (m: YieldMarket): number => {
-      if (sortKey === "utilization") return parseFloat(m.utilization);
-      if (sortKey === "liquidity") return parseFloat(m.available_liquidity_human);
-      return parseFloat(m.supply_apy);
+    const compare = (a: YieldMarket, b: YieldMarket): number => {
+      if (sortKey === "protocol") return a.protocol.localeCompare(b.protocol);
+      const metric = (m: YieldMarket): number => {
+        if (sortKey === "utilization") return parseFloat(m.utilization);
+        if (sortKey === "liquidity") return parseFloat(m.available_liquidity_human);
+        return parseFloat(m.supply_apy);
+      };
+      return metric(a) - metric(b);
     };
-    const ordered = [...markets].sort((a, b) => metric(a) - metric(b));
+    const ordered = [...markets].sort(compare);
     return sortDir === "desc" ? ordered.reverse() : ordered;
   }, [markets, sortKey, sortDir]);
 
@@ -539,7 +545,14 @@ export default function YieldsPage() {
             <table className="w-full text-xs">
               <thead className="text-muted uppercase tracking-wider">
                 <tr className="border-b border-border-dim">
-                  <th className="text-left font-medium py-2">Protocol</th>
+                  <SortHeader
+                    label="Protocol"
+                    column="protocol"
+                    sortKey={sortKey}
+                    sortDir={sortDir}
+                    onSort={toggleSort}
+                    align="left"
+                  />
                   <th className="text-left font-medium py-2">Chain</th>
                   <SortHeader
                     label="APY"
@@ -569,7 +582,7 @@ export default function YieldsPage() {
                 {sortedMarkets.map((m) => (
                   <tr key={m.market_id} className="border-b border-border-dim/40">
                     <td className="py-2">{m.protocol}</td>
-                    <td className="py-2 font-mono">{m.chain_id}</td>
+                    <td className="py-2">{chainName(m.chain_id)}</td>
                     <td className="py-2 text-right font-mono text-green">
                       {_aprPct(m.supply_apy)}
                     </td>

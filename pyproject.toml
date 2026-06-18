@@ -8,7 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
     "sqlmodel>=0.0.18",
     "web3>=7.0.0",
-    "pydefi @ git+https://github.com/yihuang/pydefi.git@asgm_split",
+    "pydefi @ git+https://github.com/yihuang/pydefi.git@main",
 ]
 
 [dependency-groups]

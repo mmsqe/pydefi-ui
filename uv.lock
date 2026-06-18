@@ -1447,7 +1447,7 @@ wheels = [
 [[package]]
 name = "pydefi"
 version = "0.1.0"
-source = { git = "https://github.com/yihuang/pydefi.git?rev=asgm_split#1835263e717eef3b17458b49d1d903897a96ffb0" }
+source = { git = "https://github.com/yihuang/pydefi.git?rev=main#1962a22a8ddad49b3545591186d5e018197fb18e" }
 dependencies = [
     { name = "aiohttp" },
     { name = "base58" },
@@ -1482,7 +1482,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.111.0" },
-    { name = "pydefi", git = "https://github.com/yihuang/pydefi.git?rev=asgm_split" },
+    { name = "pydefi", git = "https://github.com/yihuang/pydefi.git?rev=main" },
     { name = "sqlmodel", specifier = ">=0.0.18" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30.0" },
     { name = "web3", specifier = ">=7.0.0" },

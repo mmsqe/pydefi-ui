@@ -22,10 +22,11 @@ from pydefi.indexer import Pool, V2SyncEvent, V3SwapEvent
 from pydefi.indexer.models import IndexerState
 from pydefi.pathfinder.graph import PoolEdge, PoolGraph, V3PoolEdge
 from pydefi.pathfinder.hermes import HermesRouter, from_pool_graph
+from pydefi.pathfinder.dag import RouteDAG, RouteSplit, RouteSplitLeg, RouteSwap
 from pydefi.pathfinder.router import Router
-from pydefi.types import ZERO_ADDRESS, Address, RouteDAG, RouteSplit, RouteSplitLeg, RouteSwap, Token, TokenAmount
+from pydefi.types import ZERO_ADDRESS, Address, Token, TokenAmount
 from pydefi.vm import Program, build_execution_program_for_dag
-from pydefi.vm.swap import build_swap_transaction, quote_swap_transaction
+from pydefi.vm.swap import build_swap_transaction, quote_dag
 from sqlmodel import Session, func, select
 
 from backend.deps import get_indexer, get_rpc_url
@@ -229,14 +230,13 @@ async def _on_chain_quote_for_dag(dag: RouteDAG, amount_in_raw: int, chain_id: i
         from web3 import AsyncWeb3
 
         w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
-        result = await quote_swap_transaction(
-            w3,
+        amount_out = await quote_dag(
             dag,
             amount_in=amount_in_raw,
+            w3=w3,
             vm_address=Address(vm_address),
             quoter_address=Address(quoter_address),
         )
-        amount_out = int(result.amount)
         note = "on-chain quote is zero (no effective liquidity at current state)" if amount_out == 0 else ""
         return amount_out, note
     except Exception as exc:
@@ -389,12 +389,14 @@ def _add_curve_edges_if_present(graph: PoolGraph, session: Session) -> None:
     """
     import json
 
-    from pydefi.pathfinder.graph import CurvePoolEdge, CurvePoolState
-
     raw = session.connection().connection
     cur = raw.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='curvepoolstaterow'")
     if cur.fetchone() is None:
         return
+
+    # Imported here (not at module scope) so the common no-Curve-table path
+    # above never depends on this symbol.
+    from pydefi.pathfinder.graph import CurveStableEdge
 
     rows = (
         session.connection()
@@ -414,26 +416,30 @@ def _add_curve_edges_if_present(graph: PoolGraph, session: Session) -> None:
             )
             for c in coins_data
         ]
-        state = CurvePoolState(
-            pool_address=Address(pool_address_s),
-            a_coefficient=int(a_s),
-            balances=tuple(int(c["balance"]) for c in coins_data),
-            rates=tuple(int(c["rate"]) for c in coins_data),
-        )
+        pool_addr = Address(pool_address_s)
+        balances = [int(c["balance"]) for c in coins_data]
+        rates = [int(c["rate"]) for c in coins_data]
+        fee_bps = int(fee_bps_s) or 4
+        # CurveStableEdge flattens pool state onto each directional edge:
+        # `amp` is the A coefficient, `fee` is the base swap fee in 1/1e10
+        # units (bps × 1e6), and i/j index token_in/token_out in `coins`.
         for i in range(len(coin_tokens)):
             for j in range(len(coin_tokens)):
                 if i == j:
                     continue
                 graph.add_pool(
-                    CurvePoolEdge(
+                    CurveStableEdge(
                         token_in=coin_tokens[i],
                         token_out=coin_tokens[j],
-                        pool_address=state.pool_address,
+                        pool_address=pool_addr,
                         protocol="Curve",
-                        fee_bps=int(fee_bps_s) or 4,
-                        i_in=i,
-                        i_out=j,
-                        state=state,
+                        fee_bps=fee_bps,
+                        i=i,
+                        j=j,
+                        balances=balances,
+                        rates=rates,
+                        amp=int(a_s),
+                        fee=fee_bps * 10**6,
                     )
                 )
 
@@ -445,7 +451,7 @@ def _add_curve_edges_if_present(graph: PoolGraph, session: Session) -> None:
 
 def _serialize_dag(dag) -> dict:
     """Convert a RouteDAG to a JSON-serializable dict for the frontend."""
-    from pydefi.types import RouteSplit, RouteSwap
+    from pydefi.pathfinder.dag import RouteSplit, RouteSwap
 
     def _actions(actions) -> list:
         result = []
@@ -814,7 +820,7 @@ async def build_swap(body: dict) -> dict:
 
     Steps:
     1. Build PoolGraph from indexed state → find best route (off-chain).
-    2. If RPC_URL is set, run ``quote_swap_transaction()`` — a single
+    2. If RPC_URL is set, run ``quote_dag()`` — a single
        ``eth_call`` against the Uniswap QuoterV2 — to get the **actual** on-chain
        amountOut for V3 routes.  This is critical: indexed state can be stale,
        causing the off-chain estimate to diverge and the slippage check to revert.
